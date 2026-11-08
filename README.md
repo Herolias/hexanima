@@ -27,6 +27,11 @@ about 30 s for 512x768 and about 80 s for 1 Mpx; any size with sides that are mu
 > - Startup HMX self-test with automatic restart and a clean stop (SIGTERM, then SIGKILL), new settings (best quality, CPU threads, NPU worker threads, large sizes),
 >   16 KB-aligned APK packaging. Build: `QAIRT=<sdk> DEBUGGABLE=1 tools/build_fork.sh [--install]` (podman or docker, host Android SDK; the unchanged native
 >   libraries come from the upstream release APK). The QAIRT runtime is not redistributable: do not publish APKs built with it.
+> - **LoKr support** (LyCORIS / ai-toolkit `lokr_w1`/`lokr_w2`): full-rank, so it is merged into the DiT weight tiles on the phone (`lorafold`, exact Kronecker
+>   update + requant: 99.5% of the update survives, the rest is one more 8-bit rounding) and mossrun reads the merged blocks; classic LoRAs still fold into the slots.
+> - **More accurate MOSS DiT**: `MOSS_GGUF=models/MOSS-Image-SFT-Q8_0.gguf MOSS_REFDIR=out/ref python moss/export_moss.py out/dit` repacks unsloth's Q8_0 GGUF
+>   exactly into the same 8-bit tiles (same size and speed); the published pack comes from UD-Q5_K_XL (q/k 4%, o 2% weight error). Block-level check of the V81
+>   kernels against the PyTorch reference (moss/mkblk_test.py + cmp_blk.py, block 20 at 512x768): q/k/v/o/FFN/output within 0.03-0.09%.
 > - **Open**: the V81 context binaries are not hosted anywhere yet, so they are copied into the app with `adb` (`files/anima/{te0..te3,vae}.bin, te_embed.f16`,
 >   `files/vae81/vae_WxH.bin`); sizes above 4096 patches are unverified on V81.
 

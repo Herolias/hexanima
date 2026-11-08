@@ -3,7 +3,7 @@
 #   1. the native parts this fork changes, in the public Hexagon SDK + NDK container (ghcr.io/snapdragon-toolchain/arm64-android:v0.8; podman or docker):
 #      the DSP skels libmega_skel.so (Anima) and libmossskel.so (MOSS-Image) (v69 code for every generation, the HMX accumulator store picked at run time:
 #      legacy on V69..V79, the v73+ cvt path on V81),
-#      animad, megarun and mossrun (linked against a link-only libcdsprpc.so stub; the real one is /vendor/lib64/libcdsprpc.so on the phone, loaded by its soname),
+#      animad, megarun, mossrun and lorafold (linked against a link-only libcdsprpc.so stub; the real one is /vendor/lib64/libcdsprpc.so on the phone, loaded by its soname),
 #      and the NPU test programs (build_fork/tests: mega_test, gtest, ktest, ...);
 #   2. every other native library (QNN 2.28 runtime for V69, sd-cli, MOSS helpers) is taken unchanged from the upstream release APK (UPSTREAM_TAG);
 #      with QAIRT set (Qualcomm AI Engine Direct SDK 2.43+, not redistributable: never publish the resulting APK) its V81 runtime is added as
@@ -47,7 +47,8 @@ ARCH=v69 bash /work/moss/hexagon/mega/build_arch.sh
 MO=/work/moss/hexagon/mega/out_v69; MI="-w -I$S/incs -I$S/incs/stddef -I$S/ipc/fastrpc/incs -I$S/ipc/fastrpc/rpcmem/inc -I$MO -I/work/moss/hexagon/mega"
 $NDK/aarch64-linux-android31-clang -O2 $MI -c $MO/mega_stub.c -o $O/moss_stub.o
 $NDK/aarch64-linux-android31-clang++ -std=c++17 -O3 -march=armv8.2-a+fp16+dotprod $MI /work/moss/mossrun/mossrun.cpp $O/moss_stub.o -L$O/syslib -lcdsprpc -llog -static-libstdc++ -o $O/mossrun
-$NDK/llvm-strip $O/mossrun
+$NDK/aarch64-linux-android31-clang++ -std=c++17 -O3 -ffast-math -march=armv8.2-a+fp16+dotprod -static-libstdc++ /work/moss/mossrun/lorafold.cpp -o $O/lorafold
+$NDK/llvm-strip $O/mossrun $O/lorafold
 ls -la $O/megarun $O/animad'
 
 # ---- 2. stage the native libraries ----------------------------------------------------------------------------------
@@ -56,7 +57,7 @@ APK=$OUT/upstream/HexAnima-${TAG#v}.apk
 J=$ROOT/app/jnilibs/lib/arm64-v8a; rm -rf "$ROOT/app/jnilibs"; mkdir -p "$J"
 (cd "$OUT/upstream" && rm -rf x && mkdir x && cd x && unzip -q "$APK" 'lib/arm64-v8a/*' && cp lib/arm64-v8a/*.so "$J/")
 cp "$OUT/megarun" "$J/libmegarun.so"; cp "$OUT/animad" "$J/libanimad.so"; cp "$ROOT/hexagon/mega/out_v69/libmega_skel.so" "$J/libmega_skel.so"
-cp "$ROOT/moss/hexagon/mega/out_v69/libmega_skel.so" "$J/libmossskel.so"; cp "$OUT/mossrun" "$J/libmossrun.so"
+cp "$ROOT/moss/hexagon/mega/out_v69/libmega_skel.so" "$J/libmossskel.so"; cp "$OUT/mossrun" "$J/libmossrun.so"; cp "$OUT/lorafold" "$J/liblorafold.so"
 QAIRT=${QAIRT-$HOME/anima-npu/sdk/qairt/qairt/2.43.0.260128}
 if [ -n "$QAIRT" ] && [ -d "$QAIRT/lib/hexagon-v81" ]; then
   cp "$QAIRT/lib/aarch64-android/libQnnHtp.so" "$J/libQnnHtp243.so"; cp "$QAIRT/lib/aarch64-android/libQnnSystem.so" "$J/libQnnSystem243.so"

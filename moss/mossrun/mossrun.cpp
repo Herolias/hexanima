@@ -82,7 +82,7 @@ static size_t read_into(const std::string& path, uint8_t* dst, size_t maxb, bool
 #include <functional>
 static int g_keep_blocks = 0;
 static int g_nw = 3;   // DSP worker threads per call (MOSS_NW, 1..6): 3 suits V69; on V81 6 is ~13% faster with identical output, 8 hangs the DSP call
-static std::string g_ovl;   // MOSS_LORA=dir: user-LoRA patches (blkNN.ovl) laid over the DiT packs' rank-128 LoRA slots after each read
+static std::string g_ovl;   // MOSS_LORA=dir: user-LoRA patches (blkNN.ovl) laid over the DiT packs' rank-128 LoRA slots after each read, and merged LoKr blocks (blkNN.bin)
 static void apply_ovl(const std::string& pack, uint8_t* dst, size_t maxb) {
   if (g_ovl.empty() || pack.find("/dit/") == std::string::npos) return;
   std::string nm = pack.substr(pack.rfind('/') + 1); nm = g_ovl + "/" + nm.substr(0, nm.size() - 4) + ".ovl";
@@ -91,12 +91,17 @@ static void apply_ovl(const std::string& pack, uint8_t* dst, size_t maxb) {
   for (uint32_t i = 0; i < n; i++) { uint64_t o; uint32_t l; if (fread(&o, 8, 1, f) != 1 || fread(&l, 4, 1, f) != 1 || o + l > maxb || fread(dst + o, 1, l, f) != l) break; }
   fclose(f);
 }   // the first g_keep_blocks DiT packs stay in the page cache between steps (their reads become memcpy)
+static std::string pick_src(const std::string& pack) {   // a LoKr merged by lorafold: MOSS_LORA/blkNN.bin is a complete block that replaces MODELDIR/dit/blkNN.bin
+  if (g_ovl.empty() || pack.find("/dit/") == std::string::npos) return pack;
+  std::string m = g_ovl + "/" + pack.substr(pack.rfind('/') + 1);
+  return access(m.c_str(), R_OK) == 0 ? m : pack;
+}
 static bool stream_files(const std::vector<std::string>& files, Buf* bufs, const std::function<bool(int, Buf&)>& use, int keep_first = 0) {
   std::mutex mu; std::condition_variable cv; int ready = -1, freed = -2; std::atomic<bool> fail(false); const int n = (int)files.size();
   std::thread loader([&] {
     for (int i = 0; i < n; i++) {
       { std::unique_lock<std::mutex> lk(mu); cv.wait(lk, [&] { return freed >= i - 2; }); }
-      Buf& b = bufs[i & 1]; size_t got = read_into(files[i], b.p, b.sz, i < keep_first); if (!got) { fprintf(stderr, "cannot read %s\n", files[i].c_str()); fail = true; }
+      Buf& b = bufs[i & 1]; size_t got = read_into(pick_src(files[i]), b.p, b.sz, i < keep_first); if (!got) { fprintf(stderr, "cannot read %s\n", files[i].c_str()); fail = true; }
       else { apply_ovl(files[i], b.p, b.sz); sync_clean(b); }
       { std::lock_guard<std::mutex> lk(mu); ready = i; } cv.notify_all();
       if (fail) break;

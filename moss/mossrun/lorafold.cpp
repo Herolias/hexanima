@@ -4,6 +4,10 @@
 //   lorafold fold MODELDIR FILE.safetensors STRENGTH OUTDIR
 //       folds turbo (rank 128, read back from MODELDIR/dit/blkNN.bin) + user*strength into the rank-128 LoRA slots (QR-free Gram + Jacobi SVD, rank 128+r -> 128)
 //       and writes OUTDIR/blkNN.ovl = [u32 n] n x ([u64 offset][u32 len] bytes), patches mossrun lays over the pack after reading it. Prints "progress K 42".
+//       LoKr (LyCORIS / ai-toolkit: lokr_w1|lokr_w1_a+b, lokr_w2|lokr_w2_a+b): full rank, so it cannot live in the rank-128 slots (a rank-128 cut keeps only
+//       ~40-80% of a typical LoKr's energy); it is merged into the base weight tiles instead (dequant + strength*scale*kron(w1,w2) + requant, per-column q8 scales
+//       recomputed) and written as OUTDIR/blkNN.bin, a complete block that mossrun reads in place of MODELDIR/dit/blkNN.bin. Scale = alpha/dim when w1 or w2
+//       is factored (dim = its rank), else 1 (ai-toolkit stores alpha=1e10 for full matrices; ComfyUI uses 1 there too).
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -69,7 +73,7 @@ struct ST {
 struct Mod { const char* name; long in, out; };
 static const Mod MODS[] = {{"qkv", 3072, 9216}, {"q", 3072, 3072}, {"k", 3072, 3072}, {"v", 3072, 3072}, {"o", 3072, 3072}, {"ffn_up_gate", 3072, 16384}, {"ffn_down", 8192, 3072}};
 static const int NMOD = 7, NLAYER = 42;
-struct Pair { std::string A, B, alpha; };
+struct Pair { std::string A, B, alpha, w1, w2, w1a, w1b, w2a, w2b, t2; bool lokr() const { return !w1.empty() || !w2.empty() || !w1a.empty() || !w2a.empty() || !w1b.empty() || !w2b.empty() || !t2.empty(); } };
 struct Scan { std::map<std::pair<int, int>, Pair> m; int ignored = 0, te = 0, foreign = 0, unknown = 0; std::string firstUnknown; };
 
 static bool strip(std::string& n, const char* pre) { size_t l = strlen(pre); if (n.compare(0, l, pre) == 0) { n.erase(0, l); return true; } return false; }
@@ -86,6 +90,8 @@ static Scan scan(const ST& st) {
       if (mi < 0) { sc.unknown++; if (sc.firstUnknown.empty()) sc.firstUnknown = kv.first; continue; }
       Pair& p = sc.m[{layer, mi}];
       if (tail == "lora_A.weight" || tail == "lora_down.weight") p.A = kv.first; else if (tail == "lora_B.weight" || tail == "lora_up.weight") p.B = kv.first; else if (tail == "alpha") p.alpha = kv.first;
+      else if (tail == "lokr_w1") p.w1 = kv.first; else if (tail == "lokr_w2") p.w2 = kv.first; else if (tail == "lokr_w1_a") p.w1a = kv.first; else if (tail == "lokr_w1_b") p.w1b = kv.first;
+      else if (tail == "lokr_w2_a") p.w2a = kv.first; else if (tail == "lokr_w2_b") p.w2b = kv.first; else if (tail == "lokr_t2") p.t2 = kv.first;
       else { sc.unknown++; if (sc.firstUnknown.empty()) sc.firstUnknown = kv.first; }
       continue;
     }
@@ -100,7 +106,22 @@ static Scan scan(const ST& st) {
 static int fail(const char* code, const std::string& d) { printf("ERR\t%s\t%s\n", code, d.c_str()); return 1; }
 static std::string shp(const std::vector<long>& s) { std::string r = "["; for (size_t i = 0; i < s.size(); i++) r += (i ? "," : "") + std::to_string(s[i]); return r + "]"; }
 
-struct Info { int layers = 0, mods = 0, rank = 0; float alpha = 0; };
+struct Info { int layers = 0, mods = 0, rank = 0, lokr = 0; float alpha = 0; };
+// LoKr factor shapes: w1 [a,b] (or w1_a [a,r] x w1_b [r,b]), w2 [m,n] likewise; kron(w1,w2) is [a*m, b*n] = [out, in]
+static bool lokr_dims(const ST& st, const Pair& p, long& a, long& b, long& m, long& n, int& dim, std::string& why) {
+  auto sh = [&](const std::string& k) -> const std::vector<long>& { return st.t.at(k).shape; };
+  auto dt_ok = [&](const std::string& k) { return k.empty() || st.t.at(k).dt <= 2; };
+  if (!p.t2.empty()) { why = "LoKr with a Tucker core (lokr_t2, for convolutions) is not supported"; return false; }
+  for (const std::string* k : {&p.w1, &p.w2, &p.w1a, &p.w1b, &p.w2a, &p.w2b}) if (!dt_ok(*k)) { why = "only F32/F16/BF16 weights are supported"; return false; }
+  dim = 0;
+  if (!p.w1.empty()) { if (sh(p.w1).size() != 2) { why = "lokr_w1 " + shp(sh(p.w1)); return false; } a = sh(p.w1)[0]; b = sh(p.w1)[1]; }
+  else if (!p.w1a.empty() && !p.w1b.empty()) { a = sh(p.w1a)[0]; b = sh(p.w1b)[1]; dim = (int)sh(p.w1b)[0]; if (sh(p.w1a)[1] != dim) { why = "lokr_w1_a/b " + shp(sh(p.w1a)) + shp(sh(p.w1b)); return false; } }
+  else { why = "lokr_w1 missing"; return false; }
+  if (!p.w2.empty()) { if (sh(p.w2).size() != 2) { why = "lokr_w2 " + shp(sh(p.w2)); return false; } m = sh(p.w2)[0]; n = sh(p.w2)[1]; }
+  else if (!p.w2a.empty() && !p.w2b.empty()) { m = sh(p.w2a)[0]; n = sh(p.w2b)[1]; dim = (int)sh(p.w2b)[0]; if (sh(p.w2a)[1] != dim) { why = "lokr_w2_a/b " + shp(sh(p.w2a)) + shp(sh(p.w2b)); return false; } }
+  else { why = "lokr_w2 missing"; return false; }
+  return true;
+}
 static int check(const ST& st, Info& info, std::string& warn) {
   Scan sc = scan(st);
   std::string arch = st.meta.count("modelspec.architecture") ? st.meta.at("modelspec.architecture") : "", base = st.meta.count("ss_base_model_version") ? st.meta.at("ss_base_model_version") : "";
@@ -113,6 +134,13 @@ static int check(const ST& st, Info& info, std::string& warn) {
   for (auto& kv : sc.m) {
     int L = kv.first.first; const Mod& md = MODS[kv.first.second]; const Pair& p = kv.second;
     if (L >= NLAYER) return fail("LAYER", "block " + std::to_string(L) + ", MOSS-Image has 42");
+    if (p.lokr()) {
+      long a, b, m, n; int dim; std::string why;
+      if (!lokr_dims(st, p, a, b, m, n, dim, why)) return fail("SHAPE", "layer " + std::to_string(L) + " " + md.name + ": " + why);
+      if (a * m != md.out || b * n != md.in) return fail("SHAPE", "layer " + std::to_string(L) + " " + md.name + ": LoKr gives [" + std::to_string(a * m) + "," + std::to_string(b * n) + "], expected [" + std::to_string(md.out) + "," + std::to_string(md.in) + "]");
+      layers.insert(L); info.lokr++; continue;
+    }
+    if (p.A.empty() && p.B.empty()) continue;   // alpha only (ai-toolkit: q/k/v alphas of a fused qkv LoKr)
     if (p.A.empty() || p.B.empty()) return fail("NOTLORA", "layer " + std::to_string(L) + " " + md.name + ": one of the pair is missing");
     const TI &a = st.t.at(p.A), &b = st.t.at(p.B);
     if (a.dt > 2 || b.dt > 2) return fail("DTYPE", "only F32/F16/BF16 weights are supported");
@@ -123,9 +151,11 @@ static int check(const ST& st, Info& info, std::string& warn) {
     maxr = std::max<int>(maxr, (int)r); layers.insert(L);
     if (!p.alpha.empty()) { asum += st.at(st.t.at(p.alpha), 0); an++; }
   }
-  info.layers = (int)layers.size(); info.mods = (int)sc.m.size(); info.rank = maxr;
+  if (layers.empty()) return fail("NOTLORA", sc.firstUnknown.empty() ? "no LoRA weights" : sc.firstUnknown);
+  info.layers = (int)layers.size(); info.mods = 0; for (auto& kv : sc.m) if (kv.second.lokr() || !kv.second.A.empty()) info.mods++; info.rank = maxr;
   float al = an ? (float)(asum / an) : st.meta.count("ss_network_alpha") ? (float)atof(st.meta.at("ss_network_alpha").c_str()) : (float)maxr; info.alpha = al;
   if (maxr > 64) warn += "rank>64;";
+  if (info.lokr) warn += "lokr;";
   if (sc.te) warn += "text_encoder_ignored;";
   if (sc.unknown) warn += "unknown_keys=" + std::to_string(sc.unknown) + ";";
   if (sc.foreign) warn += "foreign_keys=" + std::to_string(sc.foreign) + ";";
@@ -153,6 +183,16 @@ static void quant(const float* p, size_t rs, size_t cs, int K, int N, const int*
       }
     }
   }
+}
+static void qtile(float a[32][32], u8* t) {   // one tile as quant() writes it (values rounded to fp16 first, per-column scale max/127 in fp16)
+  float sf[32];
+  for (int r = 0; r < 32; r++) for (int c = 0; c < 32; c++) a[r][c] = (float)(_Float16)a[r][c];
+  for (int c = 0; c < 32; c++) {
+    float m = 0; for (int r = 0; r < 32; r++) m = std::max(m, fabsf(a[r][c]));
+    float s = m / 127.f; if (s < 6.2e-5f) s = 6.2e-5f; _Float16 h = (_Float16)s; sf[c] = (float)h; u16 hb; memcpy(&hb, &h, 2);
+    memcpy(t + 4 * c, &hb, 2); memcpy(t + 4 * c + 2, &hb, 2);
+  }
+  for (int r = 0; r < 32; r++) for (int c = 0; c < 32; c++) { float q = nearbyintf(a[r][c] / sf[c]); q = std::min(127.f, std::max(-127.f, q)); t[128 + (((r >> 1) * 32 + c) << 1) + (r & 1)] = (u8)((int)q + 128); }
 }
 static inline float deq(const u8* t, int r, int c) { u16 hb; memcpy(&hb, t + 4 * c, 2); _Float16 h; memcpy(&h, &hb, 2); return ((int)t[128 + (((r >> 1) * 32 + c) << 1) + (r & 1)] - 128) * (float)h; }
 
@@ -228,14 +268,57 @@ static size_t a_off(int which) { size_t o = panel_off(6); static const size_t sz
 
 static bool pread_all(int fd, void* b, size_t n, size_t off) { u8* p = (u8*)b; while (n) { ssize_t r = pread(fd, p, n, off); if (r <= 0) return false; p += r; n -= r; off += r; } return true; }
 
+// ---------------------------------------------------------------- LoKr: merge into the base tiles
+struct KR { std::vector<float> w1, w2; long a = 0, b = 0, m = 0, n = 0; float sc = 0; size_t row0 = 0; bool has = false; };
+static std::vector<float> dense(const ST& st, const std::string& full, const std::string& fa, const std::string& fb, long R, long C) {
+  std::vector<float> o((size_t)R * C);
+  if (!full.empty()) { const TI& t = st.t.at(full); for (size_t i = 0; i < o.size(); i++) o[i] = st.at(t, i); return o; }
+  const TI &A = st.t.at(fa), &B = st.t.at(fb); const long r = A.shape[1];
+  std::vector<float> a((size_t)R * r), b((size_t)r * C); for (size_t i = 0; i < a.size(); i++) a[i] = st.at(A, i); for (size_t i = 0; i < b.size(); i++) b[i] = st.at(B, i);
+  for (long i = 0; i < R; i++) for (long k = 0; k < r; k++) { float x = a[(size_t)i * r + k]; if (x == 0) continue; const float* br = &b[(size_t)k * C]; float* orow = &o[(size_t)i * C]; for (long j = 0; j < C; j++) orow[j] += x * br[j]; }
+  return o;
+}
+static bool merge_block(const ST& st, const Scan& sc, const std::string& pack, int L, float ustr, const std::string& outdir) {
+  KR ks[6]; bool any = false;
+  auto setup = [&](int mi, int dst, size_t row0) {
+    auto it = sc.m.find({L, mi}); if (it == sc.m.end() || !it->second.lokr()) return; const Pair& p = it->second; KR& k = ks[dst];
+    int dim; std::string why; if (!lokr_dims(st, p, k.a, k.b, k.m, k.n, dim, why)) return;
+    k.w1 = dense(st, p.w1, p.w1a, p.w1b, k.a, k.b); k.w2 = dense(st, p.w2, p.w2a, p.w2b, k.m, k.n);
+    float scale = 1; if (dim > 0 && !p.alpha.empty()) scale = st.at(st.t.at(p.alpha), 0) / dim;
+    k.sc = scale * ustr; k.row0 = row0; k.has = true; any = true; };
+  setup(0, 0, 0); setup(0, 1, 3072); setup(0, 2, 6144); setup(1, 0, 0); setup(2, 1, 0); setup(3, 2, 0); setup(4, 3, 0); setup(5, 4, 0); setup(6, 5, 0);
+  if (!any) return true;
+  int fd = open(pack.c_str(), O_RDONLY); if (fd < 0) { fprintf(stderr, "cannot open %s\n", pack.c_str()); return false; }
+  struct stat sb; fstat(fd, &sb); std::vector<u8> buf(sb.st_size); bool rd = pread_all(fd, buf.data(), buf.size(), 0); close(fd); if (!rd) return false;
+  for (int mi = 0; mi < 6; mi++) {
+    const KR& k = ks[mi]; if (!k.has) continue;
+    const MatG& g = MG[mi]; const int KB = g.K / 32, NB = g.N / 32; const size_t po = panel_off(mi), pnl = (size_t)(KB + 4) * TILE;
+    for (int nb = 0; nb < NB; nb++) {
+      const int lb = mi == 4 ? ((nb & 1) ? NB / 2 + nb / 2 : nb / 2) : nb;
+      for (int kb = 0; kb < KB; kb++) {
+        u8* t = &buf[po + nb * pnl + (size_t)kb * TILE]; float a[32][32];
+        for (int r = 0; r < 32; r++) { const long in = kb * 32 + r, i1 = in / k.n, i2 = in % k.n;
+          for (int c = 0; c < 32; c++) { const long out = (long)k.row0 + lb * 32 + c;
+            a[r][c] = deq(t, r, c) + k.sc * k.w1[(size_t)(out / k.m) * k.b + i1] * k.w2[(size_t)(out % k.m) * k.n + i2]; } }
+        qtile(a, t);
+      }
+    }
+  }
+  std::string nm = outdir + "/" + (L < 10 ? "blk0" : "blk") + std::to_string(L), tmp = nm + ".bin.tmp";
+  FILE* f = fopen(tmp.c_str(), "wb"); if (!f) return false;
+  bool ok = fwrite(buf.data(), 1, buf.size(), f) == buf.size(); ok = fclose(f) == 0 && ok;
+  if (!ok) { unlink(tmp.c_str()); fprintf(stderr, "write failed (disk full?) %s\n", tmp.c_str()); return false; }
+  return rename(tmp.c_str(), (nm + ".bin").c_str()) == 0;
+}
+
 static bool fold_block(const ST& st, const Scan& sc, const std::string& pack, int L, float ustr, const std::string& outdir) {
   std::vector<std::pair<uint64_t, std::vector<u8>>> recs;
-  bool any = false; for (int mi = 0; mi < NMOD; mi++) if (sc.m.count({L, mi})) any = true;
+  bool any = false; for (int mi = 0; mi < NMOD; mi++) { auto it = sc.m.find({L, mi}); if (it != sc.m.end() && !it->second.A.empty() && !it->second.B.empty() && !it->second.lokr()) any = true; }
   if (any) {
     int fd = open(pack.c_str(), O_RDONLY); if (fd < 0) { fprintf(stderr, "cannot open %s\n", pack.c_str()); return false; }
     // user factors for the 6 pack matrices: A [r][in] (pointer to the tensor), B rows [N][r] with row offset; scale
     struct U { const TI* A = nullptr; const TI* B = nullptr; size_t brow0 = 0; int r = 0; float sc = 0; bool has = false; };
-    U us[6]; auto setup = [&](int mi, int dst, size_t row0) { auto it = sc.m.find({L, mi}); if (it == sc.m.end()) return; const Pair& p = it->second; U& u = us[dst]; u.A = &st.t.at(p.A); u.B = &st.t.at(p.B); u.r = (int)u.A->shape[0]; u.brow0 = row0;
+    U us[6]; auto setup = [&](int mi, int dst, size_t row0) { auto it = sc.m.find({L, mi}); if (it == sc.m.end() || it->second.lokr() || it->second.A.empty() || it->second.B.empty()) return; const Pair& p = it->second; U& u = us[dst]; u.A = &st.t.at(p.A); u.B = &st.t.at(p.B); u.r = (int)u.A->shape[0]; u.brow0 = row0;
       float al = p.alpha.empty() ? (st.meta.count("ss_network_alpha") ? (float)atof(st.meta.at("ss_network_alpha").c_str()) : (float)u.r) : st.at(st.t.at(p.alpha), 0); u.sc = al / u.r * ustr; u.has = true; };
     setup(0, 0, 0); setup(0, 1, 3072); setup(0, 2, 6144); setup(1, 0, 0); setup(2, 1, 0); setup(3, 2, 0); setup(4, 3, 0); setup(5, 4, 0); setup(6, 5, 0);
     std::vector<u8> aqkv[3];
@@ -286,15 +369,15 @@ int main(int argc, char** argv) {
   if (argc >= 3 && !strcmp(argv[1], "check")) {
     ST st; if (!st.open(argv[2])) return fail("FILE", st.err);
     Info inf; std::string warn; int rc = check(st, inf, warn); if (rc) return rc;
-    printf("OK\tlayers=%d\tmods=%d\trank=%d\talpha=%g\twarn=%s\n", inf.layers, inf.mods, inf.rank, inf.alpha, warn.c_str()); return 0;
+    printf("OK\tlayers=%d\tmods=%d\trank=%d\talpha=%g\tlokr=%d\twarn=%s\n", inf.layers, inf.mods, inf.rank, inf.alpha, inf.lokr, warn.c_str()); return 0;
   }
   if (argc >= 6 && !strcmp(argv[1], "fold")) {
     ST st; if (!st.open(argv[3])) return fail("FILE", st.err); Info inf; std::string warn; if (check(st, inf, warn)) return 1;
     Scan sc = scan(st); const float strength = (float)atof(argv[4]); std::string mdir = argv[2], out = argv[5];
-    std::atomic<int> next(0), done(0), bad(0); std::mutex mu; int nth = std::max(1u, std::min(6u, std::thread::hardware_concurrency()));
+    std::atomic<int> next(0), done(0), bad(0); std::mutex mu; int nth = std::max(1u, std::min(inf.lokr ? 4u : 6u, std::thread::hardware_concurrency()));   // LoKr: a 135 MB block per thread
     std::vector<std::thread> th; for (int i = 0; i < nth; i++) th.emplace_back([&] { for (;;) { int L = next++; if (L >= NLAYER) break;
       char p[600]; snprintf(p, sizeof p, "%s/dit/blk%02d.bin", mdir.c_str(), L);
-      if (!fold_block(st, sc, p, L, strength, out)) bad++; int d = ++done; std::lock_guard<std::mutex> lk(mu); printf("progress %d %d\n", d, NLAYER); fflush(stdout); } });
+      if (!merge_block(st, sc, p, L, strength, out) || !fold_block(st, sc, p, L, strength, out)) bad++; int d = ++done; std::lock_guard<std::mutex> lk(mu); printf("progress %d %d\n", d, NLAYER); fflush(stdout); } });
     for (auto& t : th) t.join(); if (bad) return fail("FOLD", "failed on " + std::to_string(bad.load()) + " blocks"); printf("OK\n"); return 0;
   }
   fprintf(stderr, "usage: lorafold check FILE | fold MODELDIR FILE STRENGTH OUTDIR\n"); return 2;

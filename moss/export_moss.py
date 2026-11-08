@@ -64,9 +64,14 @@ def pack_proj(g):
     d = mat(w, (None, B, 1.0)); assert len(d) == 96 * 132 * 1152, len(d)
     return d + bytes(135397376 - len(d))
 
-if __name__ == "__main__":
+if __name__ == "__main__":   # env MOSS_GGUF: source GGUF (Q8_0 repacks exactly: per-32 scales = the tile scales); MOSS_REFDIR: also write the text refiner (proj, ref0, ref1)
     out = sys.argv[1]; os.makedirs(out, exist_ok=True)
-    g = W("models/MOSS-Image-SFT-UD-Q5_K_XL.gguf"); lo = Lora("models/lora.safetensors")
+    g = W(os.environ.get("MOSS_GGUF", "models/MOSS-Image-SFT-UD-Q5_K_XL.gguf")); lo = Lora("models/lora.safetensors")
+    rd = os.environ.get("MOSS_REFDIR")
+    if rd:
+        os.makedirs(rd, exist_ok=True); open(f"{rd}/proj.bin", "wb").write(pack_proj(g))
+        for i in range(2): open(f"{rd}/ref{i}.bin", "wb").write(pack_refiner(g, i)[0])
+        print("refiner", flush=True)
     first = int(sys.argv[2]) if len(sys.argv) > 2 else 0; last = int(sys.argv[3]) if len(sys.argv) > 3 else 41
     for i in range(first, last + 1):
         b, sz = pack_layer(g, lo, i); open(f"{out}/blk{i:02d}.bin", "wb").write(b); print(i, len(b), flush=True)
