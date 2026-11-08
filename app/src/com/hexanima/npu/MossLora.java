@@ -6,7 +6,8 @@ import java.util.*;
 /** User LoRA for MOSS-Image. The picked .safetensors is copied to files/moss/lora/user.safetensors and checked by liblorafold.so ("check": key names, shapes, rank, dtype, all without
  *  loading weights). Generation folds it with the turbo adapter on the phone ("fold": ~15 s) into per-block patches files/moss/lora/ovl_<id>_<strength>/blkNN.ovl that mossrun lays over the
  *  packs' rank-128 slots (MOSS_LORA=dir). A LoKr (full rank) is merged into the base weights instead: complete blocks files/moss/lora/ovl_.../blkNN.bin (~5.5 GB) that
- *  mossrun reads in place of the pack's. Only the last (LoRA, strength) pair is kept on disk (~310 MB for a LoRA, ~5.5 GB for a LoKr). */
+ *  mossrun reads in place of the pack's. Only the last (LoRA, strength) pair is kept on disk (~310 MB for a LoRA, ~5.5 GB for a LoKr). The same fold also writes blkNN.ovf, the LoRA without the
+ *  adapter, for the full-model mode; merged LoKr blocks serve both modes. */
 final class MossLora {
     static File dir(File home) { return new File(Moss.dir(home), "lora"); }
     static File src(File home) { return new File(dir(home), "user.safetensors"); }
@@ -70,7 +71,7 @@ final class MossLora {
     /** folded patches for the picked LoRA at this strength; reuses the cache, null on failure/cancel (msg[0] = reason) */
     static File ensure(File home, String bin, String id, float strength, Progress pr, java.util.function.BooleanSupplier cancelled, String[] msg) {
         File root = dir(home), out = new File(root, "ovl_" + id + "_" + Math.round(strength * 100));
-        if (new File(out, ".ok").exists()) return out;
+        if (new File(out, ".ok").exists() && new File(out, "blk00.ovf").exists()) return out;   // .ovf (fold without the adapter, full mode) since 1.3.0-sm8850.3: older caches are rebuilt
         File[] old = root.listFiles(); if (old != null) for (File f : old) if (f.getName().startsWith("ovl_")) deleteTree(f);
         out.mkdirs();
         try {

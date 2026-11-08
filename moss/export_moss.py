@@ -4,6 +4,7 @@ blkNN.bin layout (all weight records are q8 tiles: [nb][kb] x 1152 B = 128 B sca
   W[up_gate]      [3072+128][16384] with n-blocks interleaved (up_j, gate_j)
   W[down]         [8192+128][3072]
   A[qkv]          [3072][384] (lora_down^T of q,k,v), A[o] [3072][128], A[up_gate] [3072][128], A[down] [8192][128]
+                  (the rapid-moss LoRA is stored re-split as B' = U sqrt(S), A' = sqrt(S) V^T: same delta, ~6x less q8 error than the trained factors)
   gain            f32: q_gain/sqrt(128) (128), k_gain (128), norm1 w (3072), norm2 w (3072), pad to 8192 floats
 usage: python export_moss.py OUTDIR [first last]"""
 import os, sys, numpy as np, torch
@@ -26,14 +27,21 @@ def mat(w_oi, lora=None, interleave=False):
         w = torch.cat((w, b), 0)
     return q8tiles(wt16(w.numpy()))
 
+def balance(A, B, s):
+    """the same delta s*B@A, re-split as B' = U sqrt(S), A' = sqrt(S) V^T (A' [128,in], B' [out,128]).
+    The adapter's own factors cancel heavily (|BA| ~ 0.09 |B||A|): quantized to q8 tiles as trained they lose 6-10% of the delta, the balanced split ~1-1.6%."""
+    Qb, Rb = torch.linalg.qr(B.double()); Qa, Ra = torch.linalg.qr(A.double().T)
+    U, S, Vt = torch.linalg.svd(s * Rb @ Ra.T); r = S.sqrt()
+    return ((r[:, None] * Vt) @ Qa.T).float(), (Qb @ (U * r)).float()
+
 def pack_layer(g, lo, i):
-    p = f"layers.{i}."; L = lambda n: lo(i, n)
+    p = f"layers.{i}."; bal = {n: balance(*lo(i, n)) for n in ("q", "k", "v", "o", "ffn_up_gate", "ffn_down")}; L = lambda n: (bal[n][0], bal[n][1], 1.0)
     out = []; sizes = {}
     def add(name, b): sizes[name] = len(b); out.append(b)
     for n in ("q", "k", "v", "o"): add(n, mat(g(p + f"proj.{n}.weight"), L(n)))
     add("up_gate", mat(g(p + "proj.ffn_up_gate.weight"), L("ffn_up_gate"), True))
     add("down", mat(g(p + "proj.ffn_down.weight"), L("ffn_down")))
-    At = lambda n: lo.f.get_tensor(f"diffusion_model.layers.{i}.proj.{n}.lora_down.weight").T      # [in,128]
+    At = lambda n: bal[n][0].T      # [in,128]
     add("A_qkv", q8tiles(wt16(torch.cat((At("q"), At("k"), At("v")), 1).numpy())))
     for n in ("o", "ffn_up_gate", "ffn_down"): add("A_" + n, q8tiles(wt16(At(n).contiguous().numpy())))
     gain = np.concatenate([g(p + "q_norm.weight").numpy() / np.sqrt(128.0), g(p + "k_norm.weight").numpy(), g(p + "norm1.weight").numpy(), g(p + "norm2.weight").numpy()]).astype(np.float32)

@@ -32,8 +32,18 @@ about 30 s for 512x768 and about 80 s for 1 Mpx; any size with sides that are mu
 > - **More accurate MOSS DiT**: `MOSS_GGUF=models/MOSS-Image-SFT-Q8_0.gguf MOSS_REFDIR=out/ref python moss/export_moss.py out/dit` repacks unsloth's Q8_0 GGUF
 >   exactly into the same 8-bit tiles (same size and speed); the published pack comes from UD-Q5_K_XL (q/k 4%, o 2% weight error). Block-level check of the V81
 >   kernels against the PyTorch reference (moss/mkblk_test.py + cmp_blk.py, block 20 at 512x768): q/k/v/o/FFN/output within 0.03-0.09%.
-> - **Open**: the V81 context binaries are not hosted anywhere yet, so they are copied into the app with `adb` (`files/anima/{te0..te3,vae}.bin, te_embed.f16`,
->   `files/vae81/vae_WxH.bin`); sizes above 4096 patches are unverified on V81.
+> - **MOSS-Image full-model mode** (main screen: *Fast · 4 steps* / *Full model*): the rapid-moss adapter is switched off (its LoRA-A matrices are zeroed after
+>   each block read) and mossrun runs the official MOSS sampler from `pipeline_moss_image.py`: FlowMatch Euler on the shift-5 schedule snapped to the training grid
+>   (same lengths and sigmas within 6e-8 of the reference scheduler for 1-100 steps), CFG with a negative prompt, block 22 skipped in the negative branch.
+>   Steps 8-60, CFG 1-8, negative prompt; the settings go into the PNG. Both branches run through each DiT block before the next one is read, so the weights are still
+>   streamed once per step. Speed on the 8 Elite Gen 5: ~1.6 s per DiT pass at 512x512, ~8.5 s at 1024x1024, so 20 steps with CFG at 1024x1024 take about 6 min.
+>   Checked against the fp32 PyTorch reference (`moss/check_full.py` on a `MOSS_DUMP` of a phone run): first-step velocities within 0.04% (both branches).
+>   Needs `files/moss/glue_base.bin` (the SFT model's own time embedding, `moss/export_glue_base.py`). Classic LoRAs are folded a second time without the adapter
+>   (`blkNN.ovf`); merged LoKr blocks serve both modes.
+> - **Adapter precision**: the rapid-moss LoRA's trained factors cancel heavily (|BA| is ~9% of |B||A|), so storing them as trained in 8-bit tiles lost 6-10% of
+>   its delta. `export_moss.py` and `lorafold` now store every rank-128 slot as B' = U sqrt(S), A' = sqrt(S) V^T (same product): ~1-1.6% error.
+> - **Open**: the V81 context binaries and `glue_base.bin` are not hosted anywhere yet, so they are copied into the app with `adb` (`files/anima/{te0..te3,vae}.bin,
+>   te_embed.f16`, `files/vae81/vae_WxH.bin`, `files/moss/glue_base.bin`); sizes above 4096 patches are unverified on V81; full mode is untested on V69.
 
 ## Features
 

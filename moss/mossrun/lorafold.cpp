@@ -4,6 +4,8 @@
 //   lorafold fold MODELDIR FILE.safetensors STRENGTH OUTDIR
 //       folds turbo (rank 128, read back from MODELDIR/dit/blkNN.bin) + user*strength into the rank-128 LoRA slots (QR-free Gram + Jacobi SVD, rank 128+r -> 128)
 //       and writes OUTDIR/blkNN.ovl = [u32 n] n x ([u64 offset][u32 len] bytes), patches mossrun lays over the pack after reading it. Prints "progress K 42".
+//       Also writes OUTDIR/blkNN.ovf, the same patches without the turbo adapter (user LoRA alone, A parts it does not cover zeroed) for mossrun's full-model
+//       mode, which zeroes the adapter's A matrices before laying it over.
 //       LoKr (LyCORIS / ai-toolkit: lokr_w1|lokr_w1_a+b, lokr_w2|lokr_w2_a+b): full rank, so it cannot live in the rank-128 slots (a rank-128 cut keeps only
 //       ~40-80% of a typical LoKr's energy); it is merged into the base weight tiles instead (dequant + strength*scale*kron(w1,w2) + requant, per-column q8 scales
 //       recomputed) and written as OUTDIR/blkNN.bin, a complete block that mossrun reads in place of MODELDIR/dit/blkNN.bin. Scale = alpha/dim when w1 or w2
@@ -249,11 +251,14 @@ static void fold(const std::vector<float>& BT, const std::vector<float>& AM, int
   std::vector<double> W, S; svdj(M, R, W, S);   // M rows = (U S) columns, W rows = W columns
   std::vector<int> ord(R); for (int i = 0; i < R; i++) ord[i] = i; std::sort(ord.begin(), ord.end(), [&](int x, int y) { return S[x] > S[y]; });
   const int K = 128; std::vector<float> Tb((size_t)R * K), Ta((size_t)K * R);
-  for (int c = 0; c < K; c++) {
+  for (int c = 0; c < K && c < R; c++) {   // R < 128 (user LoRA alone): the remaining slot columns stay zero
     int j = ord[c]; double s = S[j]; if (s < 1e-300) { for (int t = 0; t < R; t++) { Tb[(size_t)t * K + c] = 0; Ta[(size_t)c * R + t] = 0; } continue; }
     // U column j = M row j / s ; W column j = W row j
     std::vector<double> u(R), w(R); for (int i = 0; i < R; i++) { u[i] = M[(size_t)j * R + i] / s; w[i] = W[(size_t)j * R + i]; }
-    for (int t = 0; t < R; t++) { double x = 0, y = 0; for (int i = 0; i < R; i++) { x += Vb[(size_t)t * R + i] * ib[i] * u[i]; y += Va[(size_t)t * R + i] * ia[i] * w[i]; } Tb[(size_t)t * K + c] = (float)(x * s); Ta[(size_t)c * R + t] = (float)y; }
+    // balanced split B' = U sqrt(S), A' = sqrt(S) W^T: with all of S on one side, the q8 tiles lose 10-20% of the delta (per-column scales cannot follow singular values
+    // spanning 20-150x inside one tile); split evenly they lose ~1-1.6%
+    const double rs = sqrt(s);
+    for (int t = 0; t < R; t++) { double x = 0, y = 0; for (int i = 0; i < R; i++) { x += Vb[(size_t)t * R + i] * ib[i] * u[i]; y += Va[(size_t)t * R + i] * ia[i] * w[i]; } Tb[(size_t)t * K + c] = (float)(x * rs); Ta[(size_t)c * R + t] = (float)(y * rs); }
   }
   Bo.assign((size_t)K * N, 0); Ao.assign((size_t)K * I, 0);
   for (int k = 0; k < K; k++) { float* o = &Bo[(size_t)k * N]; for (int c = 0; c < R; c++) { float f = Tb[(size_t)c * K + k]; if (f == 0) continue; const float* x = &BT[(size_t)c * N]; for (size_t n = 0; n < N; n++) o[n] += f * x[n]; } }
@@ -311,7 +316,7 @@ static bool merge_block(const ST& st, const Scan& sc, const std::string& pack, i
   return rename(tmp.c_str(), (nm + ".bin").c_str()) == 0;
 }
 
-static bool fold_block(const ST& st, const Scan& sc, const std::string& pack, int L, float ustr, const std::string& outdir) {
+static bool fold_block(const ST& st, const Scan& sc, const std::string& pack, int L, float ustr, const std::string& outdir, bool turbo) {   // turbo: fold with the adapter (.ovl), else user alone (.ovf)
   std::vector<std::pair<uint64_t, std::vector<u8>>> recs;
   bool any = false; for (int mi = 0; mi < NMOD; mi++) { auto it = sc.m.find({L, mi}); if (it != sc.m.end() && !it->second.A.empty() && !it->second.B.empty() && !it->second.lokr()) any = true; }
   if (any) {
@@ -324,10 +329,11 @@ static bool fold_block(const ST& st, const Scan& sc, const std::string& pack, in
     std::vector<u8> aqkv[3];
     for (int mi = 0; mi < 6; mi++) {
       if (!us[mi].has) continue;
-      const MatG& g = MG[mi]; const U& u = us[mi]; const int R = 128 + u.r, KB = g.K / 32, NB = g.N / 32; const size_t N = g.N, I = g.K;
-      std::vector<float> BT((size_t)R * N), AM((size_t)R * I);
+      const MatG& g = MG[mi]; const U& u = us[mi]; const int R0 = turbo ? 128 : 0, R = R0 + u.r, KB = g.K / 32, NB = g.N / 32; const size_t N = g.N, I = g.K;
+      std::vector<float> BT((size_t)R * N), AM((size_t)R * I); const size_t po = panel_off(mi), pnl = (size_t)(KB + 4) * TILE;
+      if (turbo) {
       // turbo B^T from the panels' 4 LoRA tiles (pack nb order; up_gate interleaved up_j, gate_j)
-      std::vector<u8> pn(4 * TILE); const size_t po = panel_off(mi), pnl = (size_t)(KB + 4) * TILE;
+      std::vector<u8> pn(4 * TILE);
       for (int nb = 0; nb < NB; nb++) {
         if (!pread_all(fd, pn.data(), pn.size(), po + nb * pnl + (size_t)KB * TILE)) { close(fd); return false; }
         int lb = mi == 4 ? ((nb & 1) ? NB / 2 + nb / 2 : nb / 2) : nb;
@@ -338,10 +344,11 @@ static bool fold_block(const ST& st, const Scan& sc, const std::string& pack, in
         std::vector<u8> ar(ncb * KB * TILE); if (!pread_all(fd, ar.data(), ar.size(), a_off(which))) { close(fd); return false; }
         for (size_t cb = cofs / 32; cb < (size_t)(cofs + 128) / 32; cb++) for (int kb = 0; kb < KB; kb++) { const u8* t = &ar[(cb * KB + kb) * TILE];
           for (int r = 0; r < 32; r++) for (int c = 0; c < 32; c++) AM[(size_t)((cb * 32 + c) - cofs) * I + kb * 32 + r] = deq(t, r, c); } }
+      }
       // user part
       for (int c = 0; c < u.r; c++) {
-        float* bt = &BT[(size_t)(128 + c) * N]; for (size_t n = 0; n < N; n++) bt[n] = st.at(*u.B, (u.brow0 + n) * u.r + c) * u.sc;
-        float* am = &AM[(size_t)(128 + c) * I]; for (size_t i = 0; i < I; i++) am[i] = st.at(*u.A, (size_t)c * I + i);
+        float* bt = &BT[(size_t)(R0 + c) * N]; for (size_t n = 0; n < N; n++) bt[n] = st.at(*u.B, (u.brow0 + n) * u.r + c) * u.sc;
+        float* am = &AM[(size_t)(R0 + c) * I]; for (size_t i = 0; i < I; i++) am[i] = st.at(*u.A, (size_t)c * I + i);
       }
       std::vector<float> Bo, Ao; fold(BT, AM, R, N, I, Bo, Ao);
       // B' tiles: matrix [128][N]; only the 4 LoRA tiles of every panel
@@ -352,14 +359,14 @@ static bool fold_block(const ST& st, const Scan& sc, const std::string& pack, in
       std::vector<u8> at((size_t)4 * KB * TILE); quant(Ao.data(), 1, I, g.K, 128, nullptr, at.data());
       if (mi < 3) aqkv[mi] = std::move(at); else recs.push_back({a_off(mi == 3 ? 1 : mi == 4 ? 2 : 3), std::move(at)});
     }
-    if (us[0].has || us[1].has || us[2].has) {   // A_qkv = q|k|v parts (4 n-blocks each); a projection the user LoRA does not cover keeps its turbo part
-      const size_t part = (size_t)4 * 96 * TILE; std::vector<u8> all(3 * part);
-      for (int j = 0; j < 3; j++) { if (!aqkv[j].empty()) memcpy(&all[j * part], aqkv[j].data(), part); else if (!pread_all(fd, &all[j * part], part, a_off(0) + j * part)) { close(fd); return false; } }
+    if (us[0].has || us[1].has || us[2].has) {   // A_qkv = q|k|v parts (4 n-blocks each); a projection the user LoRA does not cover keeps its turbo part (zero without turbo)
+      const size_t part = (size_t)4 * 96 * TILE; std::vector<u8> all(3 * part, 0);
+      for (int j = 0; j < 3; j++) { if (!aqkv[j].empty()) memcpy(&all[j * part], aqkv[j].data(), part); else if (turbo && !pread_all(fd, &all[j * part], part, a_off(0) + j * part)) { close(fd); return false; } }
       recs.push_back({a_off(0), std::move(all)});
     }
     close(fd);
   }
-  FILE* f = fopen((outdir + "/" + (L < 10 ? "blk0" : "blk") + std::to_string(L) + ".ovl").c_str(), "wb"); if (!f) return false;
+  FILE* f = fopen((outdir + "/" + (L < 10 ? "blk0" : "blk") + std::to_string(L) + (turbo ? ".ovl" : ".ovf")).c_str(), "wb"); if (!f) return false;
   uint32_t n = (uint32_t)recs.size(); fwrite(&n, 4, 1, f);
   for (auto& r : recs) { uint32_t l = (uint32_t)r.second.size(); fwrite(&r.first, 8, 1, f); fwrite(&l, 4, 1, f); fwrite(r.second.data(), 1, l, f); }
   fclose(f); return true;
@@ -377,7 +384,7 @@ int main(int argc, char** argv) {
     std::atomic<int> next(0), done(0), bad(0); std::mutex mu; int nth = std::max(1u, std::min(inf.lokr ? 4u : 6u, std::thread::hardware_concurrency()));   // LoKr: a 135 MB block per thread
     std::vector<std::thread> th; for (int i = 0; i < nth; i++) th.emplace_back([&] { for (;;) { int L = next++; if (L >= NLAYER) break;
       char p[600]; snprintf(p, sizeof p, "%s/dit/blk%02d.bin", mdir.c_str(), L);
-      if (!merge_block(st, sc, p, L, strength, out) || !fold_block(st, sc, p, L, strength, out)) bad++; int d = ++done; std::lock_guard<std::mutex> lk(mu); printf("progress %d %d\n", d, NLAYER); fflush(stdout); } });
+      if (!merge_block(st, sc, p, L, strength, out) || !fold_block(st, sc, p, L, strength, out, true) || !fold_block(st, sc, p, L, strength, out, false)) bad++; int d = ++done; std::lock_guard<std::mutex> lk(mu); printf("progress %d %d\n", d, NLAYER); fflush(stdout); } });
     for (auto& t : th) t.join(); if (bad) return fail("FOLD", "failed on " + std::to_string(bad.load()) + " blocks"); printf("OK\n"); return 0;
   }
   fprintf(stderr, "usage: lorafold check FILE | fold MODELDIR FILE STRENGTH OUTDIR\n"); return 2;

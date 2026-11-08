@@ -3,13 +3,17 @@
 // The VAE (FLUX.2 decoder, QNN context) is run by vaerun on the z file written here.
 // stdin:  "load MODELDIR"                         read glue + DiT packs (resident), prints "loaded <s>"
 //         "gen IDS.i32 H W SEED STEPS OUT.z"      prints "step i <ms>" lines and "done <ms>"; OUT = fp32 [32][H/8][W/8] (BN-denormalised, unpatchified)
+//         "gen IDS.i32 H W SEED STEPS OUT.z full CFG NEG.i32 [SHIFT]"   full model: rapid-moss adapter off, the official MOSS sampler (FlowMatch Euler on the
+//                                                 shift-5 schedule snapped to the training grid), CFG with the negative prompt NEG (block 22 skipped in that branch);
+//                                                 prints "schedule N" first (snapping could merge steps; it does not for 1..100); needs MODELDIR/glue_base.bin
 //         "quit"
-// MODELDIR: glue.bin embd.q4k te/te00..te32.bin ref/{proj,ref0,ref1}.bin dit/blk00..blk41.bin
+// MODELDIR: glue.bin embd.q4k te/te00..te32.bin ref/{proj,ref0,ref1}.bin dit/blk00..blk41.bin [glue_base.bin: the SFT model's own time MLP + modulation biases]
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -83,9 +87,14 @@ static size_t read_into(const std::string& path, uint8_t* dst, size_t maxb, bool
 static int g_keep_blocks = 0;
 static int g_nw = 3;   // DSP worker threads per call (MOSS_NW, 1..6): 3 suits V69; on V81 6 is ~13% faster with identical output, 8 hangs the DSP call
 static std::string g_ovl;   // MOSS_LORA=dir: user-LoRA patches (blkNN.ovl) laid over the DiT packs' rank-128 LoRA slots after each read, and merged LoKr blocks (blkNN.bin)
+static bool g_full = false;   // full-model mode: the rapid-moss adapter's LoRA-A matrices of every DiT block read are zeroed (the slots then add nothing), and the user
+                              // LoRA comes from blkNN.ovf (folded by lorafold without the adapter) instead of blkNN.ovl
+static const size_t A_BEG = W_AQKV, A_END = W_ADN + 1179648u;   // A_qkv | A_o | A_up_gate | A_down, the block has no biases
 static void apply_ovl(const std::string& pack, uint8_t* dst, size_t maxb) {
-  if (g_ovl.empty() || pack.find("/dit/") == std::string::npos) return;
-  std::string nm = pack.substr(pack.rfind('/') + 1); nm = g_ovl + "/" + nm.substr(0, nm.size() - 4) + ".ovl";
+  if (pack.find("/dit/") == std::string::npos) return;
+  if (g_full && maxb >= A_END) memset(dst + A_BEG, 0, A_END - A_BEG);
+  if (g_ovl.empty()) return;
+  std::string nm = pack.substr(pack.rfind('/') + 1); nm = g_ovl + "/" + nm.substr(0, nm.size() - 4) + (g_full ? ".ovf" : ".ovl");
   FILE* f = fopen(nm.c_str(), "rb"); if (!f) { fprintf(stderr, "no overlay %s\n", nm.c_str()); return; }
   uint32_t n = 0; if (fread(&n, 4, 1, f) != 1) { fclose(f); return; }
   for (uint32_t i = 0; i < n; i++) { uint64_t o; uint32_t l; if (fread(&o, 8, 1, f) != 1 || fread(&l, 4, 1, f) != 1 || o + l > maxb || fread(dst + o, 1, l, f) != l) break; }
@@ -102,7 +111,7 @@ static bool stream_files(const std::vector<std::string>& files, Buf* bufs, const
     for (int i = 0; i < n; i++) {
       { std::unique_lock<std::mutex> lk(mu); cv.wait(lk, [&] { return freed >= i - 2; }); }
       Buf& b = bufs[i & 1]; size_t got = read_into(pick_src(files[i]), b.p, b.sz, i < keep_first); if (!got) { fprintf(stderr, "cannot read %s\n", files[i].c_str()); fail = true; }
-      else { apply_ovl(files[i], b.p, b.sz); sync_clean(b); }
+      else { apply_ovl(files[i], b.p, got); sync_clean(b); }
       { std::lock_guard<std::mutex> lk(mu); ready = i; } cv.notify_all();
       if (fail) break;
     }
@@ -258,27 +267,27 @@ static void matvec_f32(const f32* W, const f32* b, const f32* x, int out, int in
 static void matvec_f16(const __fp16* W, const f32* b, const f32* x, int out, int in, f32* y) {
   par_for(out, [&](int o) { const __fp16* w = W + (size_t)o * in; float s = 0; for (int i = 0; i < in; i++) s += (float)w[i] * x[i]; y[o] = (b ? b[o] : 0.f) + s; });
 }
-static void time_vecs(float code, std::vector<f32>& mod, std::vector<f32>& head) {
+static void time_vecs(float code, std::vector<f32>& mod, std::vector<f32>& head, const Glue& tg = g_glue) {   // tg: time MLP + modulation biases (adapter's or base model's)
   f32 e[256]; for (int i = 0; i < 128; i++) { const double a = (double)code * pow(10000.0, -(double)i / 128); e[i] = (f32)cos(a); e[128 + i] = (f32)sin(a); }
   std::vector<f32> a(3072), b(3072);
-  matvec_f32(g_glue.f("time_embedding.0.weight"), g_glue.f("time_embedding.0.bias"), e, 3072, 256, a.data());
+  matvec_f32(tg.f("time_embedding.0.weight"), tg.f("time_embedding.0.bias"), e, 3072, 256, a.data());
   for (auto& v : a) v = v / (1.f + expf(-v));
-  matvec_f32(g_glue.f("time_embedding.2.weight"), g_glue.f("time_embedding.2.bias"), a.data(), 3072, 3072, b.data());
+  matvec_f32(tg.f("time_embedding.2.weight"), tg.f("time_embedding.2.bias"), a.data(), 3072, 3072, b.data());
   mod.resize(18432); head.resize(6144);
-  matvec_f16(g_glue.h("shared_block_modulation.weight"), g_glue.f("shared_block_modulation.bias"), b.data(), 18432, 3072, mod.data());
-  matvec_f16(g_glue.h("video_head_modulation.weight"), g_glue.f("video_head_modulation.bias"), b.data(), 6144, 3072, head.data());
+  matvec_f16(g_glue.h("shared_block_modulation.weight"), tg.f("shared_block_modulation.bias"), b.data(), 18432, 3072, mod.data());
+  matvec_f16(g_glue.h("video_head_modulation.weight"), tg.f("video_head_modulation.bias"), b.data(), 6144, 3072, head.data());
 }
 
 // ------------------------------------------------------------------ DiT sampler
 static uint64_t ids_hash(const std::vector<int>& ids) { uint64_t h = 1469598103934665603ull ^ 0x4d4f5353ull; for (int v : ids) { h ^= (uint32_t)v; h *= 1099511628211ull; } return h; }
-static bool load_tx(const std::vector<int>& ids, std::vector<f32>& tx) {   // the text side depends on the prompt only: reuse it for the next seed / picture
-  FILE* f = fopen((g_dir + "/tx.cache").c_str(), "rb"); if (!f) return false;
+static bool load_tx(const std::vector<int>& ids, std::vector<f32>& tx, const char* name = "tx.cache") {   // the text side depends on the prompt only: reuse it for the next seed / picture
+  FILE* f = fopen((g_dir + "/" + name).c_str(), "rb"); if (!f) return false;
   uint64_t h = 0; int T = 0; bool ok = fread(&h, 8, 1, f) == 1 && fread(&T, 4, 1, f) == 1 && h == ids_hash(ids) && T == (int)ids.size();
   if (ok) { tx.resize((size_t)T * 3072); ok = fread(tx.data(), 4, tx.size(), f) == tx.size(); }
   fclose(f); return ok;
 }
-static void save_tx(const std::vector<int>& ids, const std::vector<f32>& tx) {
-  FILE* f = fopen((g_dir + "/tx.cache").c_str(), "wb"); if (!f) return; uint64_t h = ids_hash(ids); int T = (int)ids.size();
+static void save_tx(const std::vector<int>& ids, const std::vector<f32>& tx, const char* name = "tx.cache") {
+  FILE* f = fopen((g_dir + "/" + name).c_str(), "wb"); if (!f) return; uint64_t h = ids_hash(ids); int T = (int)ids.size();
   fwrite(&h, 8, 1, f); fwrite(&T, 4, 1, f); fwrite(tx.data(), 4, tx.size(), f); fclose(f);
 }
 static void upsample2(const f32* src, int h, int w, f32* dst) {   // [128][h][w] -> [128][2h][2w], bilinear with half-pixel centres
@@ -351,6 +360,107 @@ static bool generate(const std::vector<int>& ids, int Hpx, int Wpx, unsigned see
   return true;
 }
 
+// ------------------------------------------------------------------ full-model sampler (pipeline_moss_image.py: MOSSImageScheduler + CFG)
+static Glue g_glueB; static bool g_haveB = false;   // glue_base.bin
+static Buf g_blobF; static Layout g_LF; static int g_blobF_ntok = 0; static size_t g_x2 = 0, g_c2 = 0, g_s2 = 0;   // one blob, a second residual stream + rope for the negative branch
+static std::vector<float> lin32(float a, float b, int n) {   // torch.linspace in float32 (CPU kernel: first half from start, second half from end)
+  std::vector<float> v(n); if (n == 1) { v[0] = a; return v; }
+  const float step = (b - a) / (float)(n - 1); const int half = n / 2;
+  for (int i = 0; i < n; i++) v[i] = i < half ? a + step * (float)i : b - step * (float)(n - 1 - i);
+  return v;
+}
+static std::vector<float> moss_sigmas(int steps, double shift) {   // MOSSImageScheduler.set_timesteps: shifted grid snapped to the nearest training sigma, duplicates dropped
+  // (checked against the official scheduler for 1..100 steps: same lengths, sigmas within 6e-8; torch's vectorised linspace rounds a few grid points one ulp apart)
+  const int total = 1000;
+  auto grid = [&](int count, double sh) { std::vector<float> v = lin32(1.f, (float)(sh / (total + sh - 1)), count); const float s = (float)sh, s1 = (float)(sh - 1);
+    for (auto& x : v) x = s * x / (1.f + s1 * x); return v; };
+  std::vector<float> sg = grid(steps, shift), tr = grid(total, 1.0); std::reverse(tr.begin(), tr.end());
+  std::vector<float> out;
+  for (float s : sg) { int up = (int)(std::lower_bound(tr.begin(), tr.end(), s) - tr.begin()); if (up > total - 1) up = total - 1; const int lo = std::max(0, up - 1);
+    const float v = fabsf(s - tr[lo]) <= fabsf(tr[up] - s) ? tr[lo] : tr[up]; if (out.empty() || out.back() != v) out.push_back(v); }
+  return out;
+}
+static void embed_latent(const f32* lat, int Ni, f32* rows) {   // video_embedder: [128][Ni] -> rows [Ni][3072]
+  const f32* Wemb = g_glue.f("video_embedder.weight"); const f32* bemb = g_glue.f("video_embedder.bias");
+  par_for(Ni / 16 + 1, [&](int blk) { for (int t = blk * 16; t < std::min(Ni, blk * 16 + 16); t++) {
+    f32 col[128]; for (int c = 0; c < 128; c++) col[c] = lat[(size_t)c * Ni + t];
+    f32* r = &rows[(size_t)t * 3072]; for (int o = 0; o < 3072; o++) { const f32* w = Wemb + (size_t)o * 128; float a = bemb[o]; for (int c = 0; c < 128; c++) a += w[c] * col[c]; r[o] = a; } } });
+}
+static void head_velocity(f32* outrows, int Ni, const std::vector<f32>& head, f32* v) {   // final norm * (1 + scale) + shift -> final_linear_video: rows [Ni][3072] -> v [128][Ni]
+  const f32* Wfin = g_glue.f("final_linear_video.weight"); const f32* nfin = g_glue.f("final_norm_video.weight");
+  par_for(Ni / 16 + 1, [&](int blk) { for (int t = blk * 16; t < std::min(Ni, blk * 16 + 16); t++) {
+    f32* r = &outrows[(size_t)t * 3072]; double ss = 0; for (int i = 0; i < 3072; i++) ss += (double)r[i] * r[i]; const float rs = 1.f / sqrtf((float)(ss / 3072) + 1e-6f);
+    for (int i = 0; i < 3072; i++) r[i] = r[i] * rs * nfin[i] * (1.f + head[3072 + i]) + head[i];
+    for (int o = 0; o < 128; o++) { const f32* w = Wfin + (size_t)o * 3072; float a = 0; for (int i = 0; i < 3072; i++) a += w[i] * r[i]; v[(size_t)o * Ni + t] = a; } } });
+}
+static void dump(const char* name, const void* p, size_t bytes) {   // MOSS_DUMP=dir: sampler inputs/outputs for the PC reference (moss/check_full.py)
+  const char* d = getenv("MOSS_DUMP"); if (!d) return; FILE* f = fopen((std::string(d) + "/" + name).c_str(), "wb"); if (!f) return; fwrite(p, 1, bytes, f); fclose(f);
+}
+static bool generate_full(const std::vector<int>& ids, const std::vector<int>& nids, int Hpx, int Wpx, unsigned seed, int steps, float cfg, double shift, const std::string& outz) {
+  if (!g_haveB) { fprintf(stderr, "full mode needs %s/glue_base.bin\n", g_dir.c_str()); return false; }
+  const int SKIP = 22;   // uncond_skip_layers=(22,): the negative branch runs without block 22 (the official default, for the whole schedule)
+  double tall = now(); const bool cfgon = cfg != 1.f && !nids.empty();
+  std::vector<f32> tx, tn;
+  if (load_tx(ids, tx)) fprintf(stderr, "te: cached\n"); else { if (!encode_text(ids, tx)) return false; save_tx(ids, tx); }
+  if (cfgon) { if (load_tx(nids, tn, "txn.cache")) fprintf(stderr, "te (negative): cached\n"); else { if (!encode_text(nids, tn)) return false; save_tx(nids, tn, "txn.cache"); } }
+  const int T = (int)ids.size(), Tn = cfgon ? (int)nids.size() : 0, H = Hpx / 16, W = Wpx / 16, Ni = H * W, Nc = Ni + T, Nu = Ni + Tn;
+  const int ntc = (Nc + 31) / 32 * 32, ntu = (Nu + 31) / 32 * 32, ntmax = std::max(ntc, ntu);
+  if (g_blobF_ntok < ntmax) {
+    if (g_blobF.p) { unmap_buf(g_blobF); rpcmem_free(g_blobF.p); g_blobF.p = nullptr; }
+    g_LF = make_layout(ntmax, 3072, 8192, false); const size_t ns = ntmax / 32;
+    g_x2 = g_LF.total; g_c2 = g_x2 + up4k((size_t)ntmax * 3072 * 4); g_s2 = g_c2 + up4k(ns * 8192); const size_t tot = g_s2 + up4k(ns * 8192);
+    g_blobF = make_buf(tot, true); if (!g_blobF.p) return false; memset(g_blobF.p, 0, tot); g_blobF_ntok = ntmax;
+  }
+  uint8_t* blob = g_blobF.p; const Layout& L = g_LF;
+  int mc[M_NMETA], mu[M_NMETA]; for (int i = 0; i < M_NMETA; i++) mc[i] = mu[i] = L.meta[i];
+  mu[M_X] = (int)g_x2; mu[M_COS] = (int)g_c2; mu[M_SIN] = (int)g_s2;
+  for (int* m : {mc, mu}) { m[M_NW] = g_nw; m[M_NCB] = 96; m[M_MODE] = 0; }
+  mc[M_NTOK] = ntc; mc[M_NVALID] = Nc; mu[M_NTOK] = ntu; mu[M_NVALID] = Nu;
+  { std::vector<f32> bands(16); for (int i = 0; i < 16; i++) bands[i] = g_glue.f("rope.bands")[i];   // rope depends on the text length (image tokens sit at coordinate T)
+    rope_tables(bands.data(), H, W, T, ntc, (f32*)(blob + L.meta[M_COS]), (f32*)(blob + L.meta[M_SIN]));
+    if (cfgon) rope_tables(bands.data(), H, W, Tn, ntu, (f32*)(blob + g_c2), (f32*)(blob + g_s2)); }
+  const std::vector<float> sg = moss_sigmas(steps, shift); const int S = (int)sg.size();
+  printf("schedule %d\n", S); fflush(stdout);   // not "step..": the app counts lines starting with "step" as finished steps
+  std::vector<f32> x((size_t)128 * Ni), vc((size_t)128 * Ni), vu(cfgon ? (size_t)128 * Ni : 0);
+  { std::mt19937 gen(seed); std::normal_distribution<float> nd(0.f, 1.f); for (auto& a : x) a = nd(gen); }
+  dump("z.bin", x.data(), x.size() * 4); dump("tx.bin", tx.data(), tx.size() * 4); if (cfgon) dump("tn.bin", tn.data(), tn.size() * 4); dump("sig.bin", sg.data(), sg.size() * 4);
+  std::vector<f32> rows((size_t)(Ni + std::max(T, Tn)) * 3072), outrows((size_t)Ni * 3072), modv, head;
+  std::vector<std::string> df; for (int k = 0; k < NLAYER_DIT; k++) { char p[512]; snprintf(p, sizeof p, "%s/dit/blk%02d.bin", g_dir.c_str(), k); df.push_back(p); }
+  g_full = true;
+  for (int s = 0; s < S; s++) {
+    const double ts = now(); const float sig = sg[s], sn = s + 1 < S ? sg[s + 1] : 0.f, t = sig * 1000.f;   // FlowMatchEulerDiscreteScheduler: timestep = sigma * 1000 (float32)
+    embed_latent(x.data(), Ni, rows.data());
+    memcpy(&rows[(size_t)Ni * 3072], tx.data(), (size_t)T * 3072 * 4); rows_to_x32(rows.data(), Nc, 3072, (f32*)(blob + L.meta[M_X]), ntc / 32);
+    if (cfgon) { memcpy(&rows[(size_t)Ni * 3072], tn.data(), (size_t)Tn * 3072 * 4); rows_to_x32(rows.data(), Nu, 3072, (f32*)(blob + g_x2), ntu / 32); }
+    time_vecs(t, modv, head, g_glueB);
+    sync_clean(g_blobF); const double tD = now();
+    // both branches go through block k before block k+1 is needed: every pack is read once per step
+    const bool ok = stream_files(df, g_te, [&](int k, Buf& b) {
+      mc[M_FIRST] = k == 0; mc[M_REL] = k == NLAYER_DIT - 1; if (call(L, mc, b, 0, g_blobF, modv.data(), 18432)) return false;
+      if (cfgon && k != SKIP) { mu[M_FIRST] = k == 0; mu[M_REL] = k == NLAYER_DIT - 1; if (call(L, mu, b, 0, g_blobF, modv.data(), 18432)) return false; }
+      return true; }, g_keep_blocks);
+    if (!ok) { g_full = false; return false; }
+    sync_inval(g_blobF); const double tE = now();
+    x32_to_rows((const f32*)(blob + L.meta[M_X]), Ni, 3072, outrows.data()); head_velocity(outrows.data(), Ni, head, vc.data());
+    if (cfgon) { x32_to_rows((const f32*)(blob + g_x2), Ni, 3072, outrows.data()); head_velocity(outrows.data(), Ni, head, vu.data()); }
+    if (s == 0) { dump("vc0.bin", vc.data(), vc.size() * 4); if (cfgon) dump("vu0.bin", vu.data(), vu.size() * 4); }
+    const float dt = sn - sig;
+    if (cfgon) for (size_t i = 0; i < x.size(); i++) x[i] += dt * (vu[i] + cfg * (vc[i] - vu[i]));   // CFG combined in fp32, then Euler
+    else for (size_t i = 0; i < x.size(); i++) x[i] += dt * vc[i];
+    fprintf(stderr, "  step %d (t %.0f): DSP blocks %.0f ms, rest %.0f ms\n", s, t, (tE - tD) * 1e3, (now() - ts - (tE - tD)) * 1e3);
+    printf("step %d %.0f\n", s, (now() - ts) * 1000); fflush(stdout);
+  }
+  g_full = false;
+  dump("out.bin", x.data(), x.size() * 4);
+  const f32* bm = g_glue.f("bn.mean"); const f32* bv = g_glue.f("bn.var"); const int H2 = 2 * H, W2 = 2 * W;   // BN denorm + unpatchify -> [32][2H][2W]
+  std::vector<f32> zo((size_t)32 * H2 * W2);
+  for (int c = 0; c < 128; c++) { const float sc = sqrtf(bv[c] + 1e-4f), m = bm[c]; const int cc = c / 4, pi = (c / 2) % 2, pj = c % 2;
+    for (int h = 0; h < H; h++) for (int w = 0; w < W; w++) zo[((size_t)cc * H2 + 2 * h + pi) * W2 + 2 * w + pj] = x[(size_t)c * Ni + h * W + w] * sc + m; }
+  FILE* f = fopen(outz.c_str(), "wb"); if (!f) return false; fwrite(zo.data(), 4, zo.size(), f); fclose(f);
+  printf("done %.0f\n", (now() - tall) * 1000); fflush(stdout);
+  return true;
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);
   rpcmem_init();
@@ -364,6 +474,7 @@ int main(int argc, char** argv) {
     if (cmd == "load") {
       ss >> g_dir; double t0 = now();
       if (!g_glue.load(g_dir + "/glue.bin")) { printf("error glue\n"); continue; }
+      g_haveB = access((g_dir + "/glue_base.bin").c_str(), R_OK) == 0 && g_glueB.load(g_dir + "/glue_base.bin");
       { int fd = open((g_dir + "/embd.q4k").c_str(), O_RDONLY); if (fd < 0) { printf("error embd\n"); continue; } struct stat st; fstat(fd, &st); g_embd_len = st.st_size; g_embd = (uint8_t*)mmap(nullptr, g_embd_len, PROT_READ, MAP_PRIVATE, fd, 0); close(fd); }
       g_te[0] = make_buf(TE_BUF); g_te[1] = make_buf(TE_BUF); g_all.push_back(&g_te[0]); g_all.push_back(&g_te[1]); if (!g_te[0].p || !g_te[1].p) { printf("error tebuf\n"); continue; }
       g_LT = make_layout(MAXT, 4096, 12288, true); g_blobTE = make_buf(g_LT.total, true); if (!g_blobTE.p) { printf("error teblob\n"); continue; } memset(g_blobTE.p, 0, g_LT.total);
@@ -375,10 +486,14 @@ int main(int argc, char** argv) {
       printf("loaded %.1f\n", now() - t0); continue;
     }
     if (cmd == "gen") {
-      std::string idsf, outz; int H, W, steps; unsigned seed; ss >> idsf >> H >> W >> seed >> steps >> outz;
-      std::vector<int> ids; { FILE* f = fopen(idsf.c_str(), "rb"); if (!f) { printf("error ids\n"); continue; } fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); ids.resize(n / 4); if (fread(ids.data(), 4, ids.size(), f) != ids.size()) {} fclose(f); }
-      if (ids.empty() || (int)ids.size() > MAXT || H % 16 || W % 16 || (H / 16) * (W / 16) > 6144 || steps < 1 || steps > 4) { printf("error args\n"); continue; }
-      if (!generate(ids, H, W, seed, steps, outz)) printf("error gen\n");
+      std::string idsf, outz, mode, negf; int H, W, steps; unsigned seed; float cfg = 1.f; double shift = 5.0; ss >> idsf >> H >> W >> seed >> steps >> outz >> mode;
+      const bool full = mode == "full"; if (full) { ss >> cfg >> negf; double sh; if (ss >> sh) shift = sh; }
+      auto read_ids = [](const std::string& fn, std::vector<int>& v) { FILE* f = fopen(fn.c_str(), "rb"); if (!f) return false; fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+        v.resize(n / 4); const bool ok = fread(v.data(), 4, v.size(), f) == v.size(); fclose(f); return ok; };
+      std::vector<int> ids, nids; if (!read_ids(idsf, ids)) { printf("error ids\n"); continue; }
+      if (full && cfg != 1.f && (negf.empty() || !read_ids(negf, nids) || nids.empty() || (int)nids.size() > MAXT)) { printf("error negative ids\n"); continue; }
+      if (ids.empty() || (int)ids.size() > MAXT || H % 16 || W % 16 || (H / 16) * (W / 16) > 6144 || steps < 1 || steps > (full ? 100 : 4) || !(cfg >= 0.f && cfg <= 20.f) || !(shift > 0 && shift <= 20)) { printf("error args\n"); continue; }
+      if (full ? !generate_full(ids, nids, H, W, seed, steps, cfg, shift, outz) : !generate(ids, H, W, seed, steps, outz)) printf("error gen\n");
     }
   }
   mega_close(g_h);

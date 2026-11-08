@@ -64,6 +64,7 @@ public class Main extends Base {
     MultiAutoCompleteTextView prompt;
     EditText seed, wEdit, hEdit;
     LinearLayout loraBox; TextView loraName, loraInfo, strText; SeekBar strBar; Button loraPick, loraDrop;
+    LinearLayout mossBox, fullBox; Button modeFast, modeFull; TextView modeInfo, stepText, cfgText; SeekBar stepBar, cfgBar; EditText negEdit;
     ProgressBar bar, ramBar;
     ImageView img;
     File lastFile;
@@ -267,6 +268,38 @@ public class Main extends Base {
         sr.addView(dice, dl);
         root.addView(sr);
 
+        // MOSS-Image sampler: Fast = the rapid-moss 4-step adapter (distilled: no CFG, no negative prompt); Full = the model itself with the official sampler (steps, CFG, negative prompt)
+        mossBox = new LinearLayout(this); mossBox.setOrientation(LinearLayout.VERTICAL);
+        mossBox.addView(label(L.s("РЕЖИМ", "MODE")));
+        LinearLayout mr = new LinearLayout(this);
+        modeFast = button(L.s("Быстрый · 4 шага", "Fast · 4 steps"), CARD, TXT); modeFast.setOnClickListener(v -> setMossFull(false));
+        modeFull = button(L.s("Полная модель", "Full model"), CARD, TXT); modeFull.setOnClickListener(v -> setMossFull(true));
+        mr.addView(modeFast, new LinearLayout.LayoutParams(0, dp(44), 1));
+        LinearLayout.LayoutParams mfl = new LinearLayout.LayoutParams(0, dp(44), 1); mfl.leftMargin = dp(8); mr.addView(modeFull, mfl);
+        mossBox.addView(mr);
+        modeInfo = text("", 12, DIM, false); modeInfo.setPadding(dp(4), dp(6), dp(4), 0); mossBox.addView(modeInfo);
+        fullBox = new LinearLayout(this); fullBox.setOrientation(LinearLayout.VERTICAL);
+        stepBar = new SeekBar(this); stepBar.setMax(Moss.FULL_STEPS_MAX - Moss.FULL_STEPS_MIN);
+        stepBar.setProgress(Math.max(0, Math.min(stepBar.getMax(), prefs().getInt("moss_steps", Moss.FULL_STEPS_DEF) - Moss.FULL_STEPS_MIN)));
+        stepText = text("", 14, TXT, true); fullBox.addView(seekRow(L.s("Шаги", "Steps"), stepBar, stepText));
+        cfgBar = new SeekBar(this); cfgBar.setMax(28);   // CFG 1.0 .. 8.0 in 0.25
+        cfgBar.setProgress(Math.max(0, Math.min(28, Math.round((prefs().getFloat("moss_cfg", Moss.CFG_DEF) - 1f) * 4))));
+        cfgText = text("", 14, TXT, true); fullBox.addView(seekRow("CFG", cfgBar, cfgText));
+        SeekBar.OnSeekBarChangeListener sl = new SeekBar.OnSeekBarChangeListener() {
+            public void onProgressChanged(SeekBar b, int p, boolean u) { showFullValues(); if (u) prefs().edit().putInt("moss_steps", mossSteps()).putFloat("moss_cfg", mossCfg()).apply(); }
+            public void onStartTrackingTouch(SeekBar b) { }
+            public void onStopTrackingTouch(SeekBar b) { }
+        };
+        stepBar.setOnSeekBarChangeListener(sl); cfgBar.setOnSeekBarChangeListener(sl);
+        fullBox.addView(label(L.s("НЕГАТИВНОЕ ОПИСАНИЕ  ·  необязательно", "NEGATIVE PROMPT  ·  optional")));
+        negEdit = field(L.s("например: размыто, лишние пальцы, текст", "e.g. blurry, extra fingers, text"));
+        negEdit.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE); negEdit.setMinLines(2); negEdit.setGravity(Gravity.TOP);
+        negEdit.setBackground(bg(CARD, 14)); negEdit.setText(prefs().getString("moss_neg", ""));
+        fullBox.addView(negEdit, new LinearLayout.LayoutParams(-1, -2));
+        mossBox.addView(fullBox);
+        root.addView(mossBox);
+        setMossFull(prefs().getBoolean("moss_full", false));
+
         // MOSS-Image: user LoRA (picked file is checked at once; strength slider; folded with the turbo adapter on first use)
         loraBox = new LinearLayout(this); loraBox.setOrientation(LinearLayout.VERTICAL);
         loraBox.addView(label(L.s("LORA  ·  необязательно", "LORA  ·  optional")));
@@ -349,7 +382,8 @@ public class Main extends Base {
         super.onPause();
         visible = false;
         ui.removeCallbacks(ramTick);
-        prefs().edit().putString("prompt", prompt.getText().toString()).putString("seed", seed.getText().toString()).putString("model", model).putInt("w", resW).putInt("h", resH).apply();
+        prefs().edit().putString("prompt", prompt.getText().toString()).putString("seed", seed.getText().toString()).putString("model", model).putInt("w", resW).putInt("h", resH)
+            .putString("moss_neg", negEdit != null ? negEdit.getText().toString() : prefs().getString("moss_neg", "")).apply();
     }
 
     @Override protected void onResume() {
@@ -402,11 +436,44 @@ public class Main extends Base {
                 if (m == null || m.optString("prompt").isEmpty()) { Toast.makeText(this, L.s("В этом файле нет настроек генерации", "This file has no generation settings"), Toast.LENGTH_LONG).show(); return; }
                 prompt.setText(m.optString("prompt")); seed.setText(m.optString("seed", "-1"));
                 customOpen = false; if (m.optInt("w") > 0) setRes(m.optInt("w"), m.optInt("h"));
+                if (m.has("mode")) {   // MOSS-Image sampler settings
+                    if (m.has("steps")) stepBar.setProgress(m.optInt("steps", Moss.FULL_STEPS_DEF) - Moss.FULL_STEPS_MIN);
+                    if (m.has("cfg")) cfgBar.setProgress(Math.round(((float) m.optDouble("cfg", Moss.CFG_DEF) - 1f) * 4));
+                    negEdit.setText(m.optString("negative", "")); setMossFull(m.optString("mode").equals("full"));
+                    prefs().edit().putInt("moss_steps", mossSteps()).putFloat("moss_cfg", mossCfg()).putString("moss_neg", negEdit.getText().toString()).apply();
+                }
                 Toast.makeText(this, L.s("Настройки загружены из файла", "Settings loaded from the file"), Toast.LENGTH_SHORT).show();
             } catch (Exception e) { Toast.makeText(this, e.toString(), Toast.LENGTH_LONG).show(); }
         }
     }
 
+
+    // ---- MOSS-Image sampler mode --------------------------------------------------------------------
+    boolean mossFull() { return modeFull != null && prefs().getBoolean("moss_full", false); }
+    int mossSteps() { return stepBar == null ? Moss.FULL_STEPS_DEF : Moss.FULL_STEPS_MIN + stepBar.getProgress(); }
+    float mossCfg() { return cfgBar == null ? Moss.CFG_DEF : 1f + cfgBar.getProgress() * 0.25f; }
+    LinearLayout seekRow(String name, SeekBar sb, TextView val) {
+        LinearLayout r = new LinearLayout(this); r.setGravity(Gravity.CENTER_VERTICAL); r.setPadding(0, dp(8), 0, 0);
+        TextView n = text(name, 14, TXT, false); n.setMinWidth(dp(56)); r.addView(n);
+        r.addView(sb, new LinearLayout.LayoutParams(0, -2, 1));
+        val.setMinWidth(dp(44)); val.setGravity(Gravity.END); r.addView(val);
+        return r;
+    }
+    void showFullValues() {
+        stepText.setText(String.valueOf(mossSteps())); cfgText.setText(String.format(java.util.Locale.US, "%.2f", mossCfg()));
+        if (genBtn != null && !busy) genBtn.setText(genLabel());
+    }
+    void setMossFull(boolean on) {
+        if (busy) return;
+        prefs().edit().putBoolean("moss_full", on).apply();
+        modeFast.setBackground(bg(on ? CARD : ACC, 14)); modeFast.setTextColor(on ? TXT : ON_ACC);
+        modeFull.setBackground(bg(on ? ACC : CARD, 14)); modeFull.setTextColor(on ? ON_ACC : TXT);
+        fullBox.setVisibility(on ? View.VISIBLE : View.GONE);
+        modeInfo.setText(on ? L.s("Сама модель с официальным сэмплером (Euler, CFG): лучше анатомия и следование описанию, но каждый шаг с CFG > 1 считает модель дважды. Официально: 50 шагов, CFG 3.",
+                "The model itself with the official sampler (Euler, CFG): better anatomy and prompt following, but every step with CFG above 1 runs the model twice. Official settings: 50 steps, CFG 3.")
+            : L.s("Турбо-адаптер rapid-moss: 4 шага, без CFG и негативного описания (дистиллированная модель).", "The rapid-moss turbo adapter: 4 steps, no CFG or negative prompt (a distilled model)."));
+        showFullValues();
+    }
 
     // ---- MOSS-Image user LoRA ---------------------------------------------------------------------
     String loraId() { return prefs().getString("moss_lora_id", ""); }
@@ -608,8 +675,9 @@ public class Main extends Base {
     /** rough time to a picture: the catalog speed at 512x768 scaled by the patch count, times the number of pictures */
     String genLabel() {
         if (model.isEmpty()) return L.s("Скачать модель", "Get a model");
-        long est = Math.max(3, Moss.is(model) ? Moss.estimate(store.speed(model), resW, resH) : Math.round(store.speed(model) * ((resW / 16) * (resH / 16)) / 1536.0)) * count;
-        return count > 1 ? L.f("Генерировать ×%d  ·  ~%d с", "Generate ×%d  ·  ~%d s", count, est) : L.f("Генерировать  ·  ~%d с", "Generate  ·  ~%d s", est);
+        long est = Math.max(3, Moss.is(model) ? Moss.estimate(store.speed(model), resW, resH, mossFull(), mossSteps(), mossCfg()) : Math.round(store.speed(model) * ((resW / 16) * (resH / 16)) / 1536.0)) * count;
+        String t = est >= 120 ? L.f("~%d мин", "~%d min", Math.round(est / 60.0)) : L.f("~%d с", "~%d s", est);
+        return count > 1 ? L.f("Генерировать ×%d  ·  %s", "Generate ×%d  ·  %s", count, t) : L.f("Генерировать  ·  %s", "Generate  ·  %s", t);
     }
 
     /** Share of the DiT time spent after `st` steps: the first two of the 4 steps use a half-size latent and cost ~0.3 (512x768) / ~0.22 (960x1536) of a full step. */
@@ -625,6 +693,7 @@ public class Main extends Base {
             int c = working ? WARN : isLoaded ? OK : DIM;
             chipDot.setTextColor(c);
             if (loraBox != null) loraBox.setVisibility(isMoss() ? View.VISIBLE : View.GONE);
+            if (mossBox != null) { mossBox.setVisibility(isMoss() ? View.VISIBLE : View.GONE); modeFast.setEnabled(!busy); modeFull.setEnabled(!busy); }
             state.setText(working ? msg : isMoss() ? L.s("MOSS-Image: текст, DiT и VAE работают на NPU; веса читаются с накопителя при каждой картинке", "MOSS-Image: text encoder, DiT and VAE run on the NPU; the weights are streamed from storage for every picture") : isLoaded ? L.s("Модель загружена в NPU, генерация стартует сразу", "Model is loaded on the NPU, generation starts at once")
                 : L.s("Модель выгружена: при генерации загрузится сама (~5 с)", "Model is unloaded: it loads itself when you generate (~5 s)"));
             loadBtn.setText(isLoaded ? L.s("Выгрузить", "Unload") : L.s("Загрузить", "Load"));
@@ -840,6 +909,16 @@ public class Main extends Base {
         final String ve = Moss.vaeError(home);
         if (ve != null) { ui.post(() -> Toast.makeText(this, ve, Toast.LENGTH_LONG).show()); return null; }
         try { Moss.writeIds(home, pr, ids); } catch (Exception e) { ui.post(() -> Toast.makeText(this, "tokenizer: " + e, Toast.LENGTH_LONG).show()); return null; }
+        final boolean full = mossFull(); final int steps = full ? mossSteps() : STEPS; final float cfg = mossCfg(); final String neg = negEdit.getText().toString().trim();
+        String fullEnv = "";
+        if (full) {
+            prefs().edit().putString("moss_neg", neg).apply();
+            final String fe = Moss.fullError(home);
+            if (fe != null) { ui.post(() -> Toast.makeText(this, fe, Toast.LENGTH_LONG).show()); return null; }
+            final File nf = new File(M, "neg.i32");
+            try { Moss.writeIds(home, neg, nf); } catch (Exception e) { ui.post(() -> Toast.makeText(this, "tokenizer: " + e, Toast.LENGTH_LONG).show()); return null; }
+            fullEnv = "MOSS_FULL=" + q("full " + String.format(java.util.Locale.US, "%.2f", cfg) + " " + nf.getPath()) + " ";
+        }
         String loraEnv = ""; final boolean useLora = loraOn(); final float lstr = strBar.getProgress() * 0.05f;
         if (useLora) {
             final String[] msg = {""};
@@ -851,18 +930,19 @@ public class Main extends Base {
         Thread poll = new Thread(() -> {
             while (!done[0]) {
                 try { Thread.sleep(700); } catch (InterruptedException e) { return; }
-                String s = su("echo $(grep -c '^te:' " + M + "/moss.log) $(grep -c '^refiner:' " + M + "/moss.log) $(grep -c '^step' " + M + "/moss.log) $(grep -c '^done' " + M + "/moss.log)", true);
+                String s = su("echo $(grep -c '^te:' " + M + "/moss.log) $(grep -c '^refiner:' " + M + "/moss.log) $(grep -c '^step' " + M + "/moss.log) $(grep -c '^done' " + M + "/moss.log) $(sed -n 's/^schedule //p' " + M + "/moss.log)", true);
                 try {
-                    String[] a = s.split("\\s+"); int te = Integer.parseInt(a[0]), rf = Integer.parseInt(a[1]), st = Integer.parseInt(a[2]), dn = Integer.parseInt(a[3]);
+                    String[] a = s.trim().split("\\s+"); int te = Integer.parseInt(a[0]), rf = Integer.parseInt(a[1]), st = Integer.parseInt(a[2]), dn = Integer.parseInt(a[3]);
+                    final int all = a.length > 4 ? Integer.parseInt(a[4]) : steps;   // full mode: the schedule mossrun settled on
                     if (dn > 0) setProgressUi(94, L.s("Декодирование…", "Decoding…"), t0);
-                    else if (rf > 0) setProgressUi(22 + 70 * st / STEPS, L.f("Шаг %d/%d", "Step %d/%d", Math.min(st + 1, STEPS), STEPS), t0);
+                    else if (rf > 0) setProgressUi(22 + 70 * st / all, L.f("Шаг %d/%d", "Step %d/%d", Math.min(st + 1, all), all), t0);
                     else if (te > 0) setProgressUi(20, L.s("Подготовка текста…", "Preparing the text…"), t0);
                     else setProgressUi(8, L.s("Кодирование текста на NPU…", "Encoding the text on the NPU…"), t0);
                 } catch (Exception ignored) { }
             }
         });
         poll.start();
-        su("rm -f " + q(raw.getPath()) + "; " + loraEnv + Moss.env(this) + "M=" + q(M.getPath()) + " sh " + D + "/moss.sh " + q(ids.getPath()) + " " + w + " " + h + " " + seedS + " " + STEPS + " " + q(raw.getPath()) + " < /dev/null >> " + D + "/gen.log 2>&1", false);
+        su("rm -f " + q(raw.getPath()) + "; " + loraEnv + fullEnv + Moss.env(this) + "M=" + q(M.getPath()) + " sh " + D + "/moss.sh " + q(ids.getPath()) + " " + w + " " + h + " " + seedS + " " + steps + " " + q(raw.getPath()) + " < /dev/null >> " + D + "/gen.log 2>&1", false);
         done[0] = true;
         try { poll.join(); } catch (InterruptedException ignored) { }
         if (cancelled) return null;
@@ -870,6 +950,7 @@ public class Main extends Base {
             byte[] png = Moss.png(raw, w, h); raw.delete();
             JSONObject meta = new JSONObject().put("prompt", pr).put("seed", seedS).put("w", w).put("h", h).put("model", modelName()).put("id", model).put("sec", (System.currentTimeMillis() - t0) / 1000.0);
             if (useLora) meta.put("lora", prefs().getString("moss_lora_name", "LoRA")).put("lora_strength", lstr);
+            meta.put("mode", full ? "full" : "fast"); if (full) meta.put("steps", steps).put("cfg", cfg).put("negative", neg);
             return Gallery.save(this, PngMeta.embed(png, meta), meta);
         } catch (Exception e) { ui.post(() -> Toast.makeText(this, L.f("Ошибка генерации: %s (лог files/moss/moss.log)", "Generation failed: %s (log files/moss/moss.log)", e.getMessage()), Toast.LENGTH_LONG).show()); return null; }
     }
