@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <csignal>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -89,8 +90,29 @@ static void make_rope(int gh, int gw, f32* cs, f32* sn) {   // tiles [slab][j][3
   }
 }
 
+// SIGTERM (anima.sh stop): finish the DSP call in flight, then release VTCM/HMX/pool through mega_close and exit. Being SIGKILLed in the middle of a
+// block left the HMX unusable for the next engine start on V79 (upstream PITFALLS / 1.2.2); a clean exit avoids that.
+static volatile sig_atomic_t g_stop = 0;
+static void on_term(int) { g_stop = 1; }
+
+// HMX self-test: one fp16 GEMM 32x256x64 through the SDK path (mega_probe stage 2) against a scalar reference on the DSP.
+// A silently unavailable HMX returns zeros (error ~ the size of the values, >> 0.5); VTCM/HMX busy (another megarun starting at the same moment) is retried.
+static bool hmx_selftest(remote_handle64 h, int first) {
+  for (int a = 0, bad = 0; a < 40; a++) {
+    long long cyc = 0; float err = -1; int lockrc = -999, vtcmrc = -999;
+    int r = mega_probe(h, 256, 1, 2, &cyc, &err, &lockrc, &vtcmrc);
+    if (r == 0 && lockrc == 0 && err >= 0 && err < 0.5f) { if (a) fprintf(stderr, "megarun %d: HMX self-test ok after %d retries\n", first, a); return true; }
+    bool busy = r == 0 && (vtcmrc < 0 || (lockrc != 0 && lockrc != -999));
+    fprintf(stderr, "megarun %d: HMX self-test %s (r=0x%x lock=%d vtcm=%d err=%g)\n", first, busy ? "busy" : "FAILED", r, lockrc, vtcmrc, err);
+    if (!busy && ++bad >= 4) return false;
+    usleep(busy ? 150000 : 500000);
+  }
+  return false;
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: megarun HMXDIR [FIRST COUNT]\n"); return 1; }
+  { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = on_term; sigaction(SIGTERM, &sa, nullptr); signal(SIGPIPE, SIG_IGN); }   // no SA_RESTART: a blocking stdin read returns
   std::string dir = argv[1]; int first = argc > 2 ? atoi(argv[2]) : 0, count = argc > 3 ? atoi(argv[3]) : 28;
   rpcmem_init();
   std::vector<uint8_t*> wts(count);
@@ -110,6 +132,8 @@ int main(int argc, char** argv) {
   remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE, &ud, sizeof ud);
   remote_handle64 h = 0; int r = mega_open(mega_URI CDSP_DOMAIN, &h);
   if (r) { fprintf(stderr, "mega_open 0x%x\n", r); return 1; }
+  if (!getenv("MEGA_NOSELFTEST") && !hmx_selftest(h, first)) { fprintf(stderr, "megarun %d: HMX unavailable\n", first); printf("error hmx\n"); fflush(stdout); mega_close(h); return 3; }
+  const int nw_env = getenv("MEGA_NW") ? atoi(getenv("MEGA_NW")) : 0;   // DSP worker threads per block (skel default 3, its maximum 5); V81 has more HVX contexts than V69
   for (int i = 0; i < count; i++) {   // map once (a DSP process takes at most ~13 of these buffers: run several megarun processes for 28 blocks)
     int fd = rpcmem_to_fd(wts[i]);
     dma_buf_sync_ sy = {(1ull << 2) | 3};   // DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW: clean CPU caches so the DSP sees the weights
@@ -129,7 +153,7 @@ int main(int argc, char** argv) {
   int cur_gh = -1, cur_gw = -1;
   std::vector<f32> xin((size_t)D * TMAX), emb(D), lora(6144), ctxf((size_t)1024 * NCTX), mod((size_t)count * 9 * D);
   std::string line;
-  while (std::getline(std::cin, line)) {
+  while (!g_stop && std::getline(std::cin, line)) {
     std::istringstream ss(line); std::string cmd; ss >> cmd;
     if (cmd == "quit") break;
     if (cmd != "run") continue;
@@ -147,6 +171,7 @@ int main(int argc, char** argv) {
       if (fastrpc_mmap(CDSP_DOMAIN_ID, blobfd, blob, 0, Lb.total, FASTRPC_MAP_FD)) { fprintf(stderr, "blob mmap failed\n"); printf("error\n"); fflush(stdout); continue; }
     }
     Layout L = layout(T);
+    if (nw_env > 0 && nw_env <= 5) L.meta[M_NW] = nw_env;
     if (gh != cur_gh || gw != cur_gw) { make_rope(gh, gw, (f32*)(blob + L.meta[M_COS]), (f32*)(blob + L.meta[M_SIN])); cur_gh = gh; cur_gw = gw; }
     to_ctx16((const f32*)cb.data(), (__fp16*)(blob + L.meta[M_CTX]));
     bool xin32 = xi.size() > 4 && xi.compare(xi.size() - 4, 4, ".x32") == 0;
@@ -175,6 +200,7 @@ int main(int argc, char** argv) {
     for (int k = 0; k < count; k++) if (!((skipmask >> (first + k)) & 1)) { if (firstRun < 0) firstRun = k; lastRun = k; }
     for (int k = 0; k < count && ok; k++) {
       if ((skipmask >> (first + k)) & 1) continue;
+      if (g_stop) { ok = false; break; }   // stop between DSP calls, never in the middle of one
       while (mdone.load(std::memory_order_acquire) <= k) {}
       L.meta[M_FIRST] = k == firstRun; L.meta[M_REL] = k == lastRun;   // VTCM, pool and power votes are held across the blocks of one run, released after the last
       double tm1 = now();

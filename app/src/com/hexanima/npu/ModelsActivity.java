@@ -59,9 +59,10 @@ public class ModelsActivity extends Base {
         src.setOnClickListener(v -> { boolean show = url.getVisibility() != View.VISIBLE; url.setVisibility(show ? View.VISIBLE : View.GONE); if (!show) load(); });
         list = new LinearLayout(this); list.setOrientation(LinearLayout.VERTICAL);
         col.addView(list);
-        String soc = android.os.Build.VERSION.SDK_INT >= 31 ? android.os.Build.SOC_MODEL : "?";
-        boolean ok = soc.equals("SM8475") || soc.equals("SM8450");
+        String soc = Compat.soc();
+        boolean ok = Compat.chipOk();
         info.setText((ok ? L.f("Чип %s · подходит (%s)", "Chip %s · supported (%s)", soc, Compat.archLabel()) : L.f("Чип %s · проверено только на Snapdragon 8 Gen 1 / 8+ Gen 1", "Chip %s · tested only on Snapdragon 8 Gen 1 / 8+ Gen 1", soc))
+            + (ok && !Compat.qnnCommon() ? "\n" + L.s("Текстовый энкодер и декодер работают на CPU, DiT — на NPU", "Text encoder and decoder run on the CPU, the DiT on the NPU") : "")
             + "\n" + L.f("Свободно %.1f ГБ", "Free %.1f GB", getFilesDir().getUsableSpace() / 1e9));
         if (downloading) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         load();
@@ -77,7 +78,7 @@ public class ModelsActivity extends Base {
         final String base = url.getText().toString().trim().replaceAll("/*$", "") + "/";
         getSharedPreferences("anima", 0).edit().putString("base", base).apply();
         io.submit(() -> {
-            try { final List<Models.Item> cat = store.catalog(base); for (Models.Item it : cat) store.refreshMeta(it); ui.post(() -> { items = cat; render(); }); }
+            try { final List<Models.Item> cat = store.catalog(base); if (Compat.chipOk() && !Compat.mossOk()) cat.removeIf(it -> it.moss); /* MOSS-Image decodes through a QNN context that exists for V69 only */ for (Models.Item it : cat) store.refreshMeta(it); ui.post(() -> { items = cat; render(); }); }
             catch (Exception e) { ui.post(() -> { list.removeAllViews(); list.addView(text(L.f("Каталог недоступен: %s", "Catalog unavailable: %s", e.getMessage()), 13, BAD, false)); }); }
         });
     }
@@ -110,7 +111,7 @@ public class ModelsActivity extends Base {
                 Button x = button(L.s("Отменить", "Cancel"), FIELD, TXT); x.setOnClickListener(v -> cancel.set(true));
                 LinearLayout.LayoutParams xl = new LinearLayout.LayoutParams(-1, dp(42)); xl.topMargin = dp(8); c.addView(x, xl);
             } else {
-                String label = have ? L.s("Удалить", "Delete") : L.f("Скачать  %s ГБ", "Download  %s GB", gb(it.size + (needCommon ? store.commonSize : 0)));
+                String label = have ? L.s("Удалить", "Delete") : L.f("Скачать  %s ГБ", "Download  %s GB", gb(it.size + (needCommon ? store.commonBytes() : 0)));
                 Button bt = button(label, have ? FIELD : ACC, have ? BAD : ON_ACC); bt.setEnabled(!downloading); bt.setAlpha(downloading ? .5f : 1f);
                 bt.setOnClickListener(v -> {
                     if (have) { store.delete(it.id); deleted = it.id; render(); }
@@ -121,7 +122,7 @@ public class ModelsActivity extends Base {
             }
         }
         if (items.isEmpty()) list.addView(text(L.s("Каталог пуст", "The catalog is empty"), 13, DIM, false));
-        else if (!store.commonInstalled() && hasAnima()) { TextView n = text(L.f("К первой модели добавятся общие файлы (%s ГБ): текстовый энкодер и VAE. Они качаются один раз.", "The first model also fetches the shared files (%s GB): text encoder and VAE, once.", gb(store.commonSize)), 12, DIM, false); n.setPadding(dp(2), 0, 0, 0); list.addView(n); }
+        else if (!store.commonInstalled() && hasAnima()) { TextView n = text(L.f("К первой модели добавятся общие файлы (%s ГБ): текстовый энкодер и VAE. Они качаются один раз.", "The first model also fetches the shared files (%s GB): text encoder and VAE, once.", gb(store.commonBytes())), 12, DIM, false); n.setPadding(dp(2), 0, 0, 0); list.addView(n); }
     }
 
     boolean hasAnima() { for (Models.Item it : items) if (!it.moss) return true; return false; }
@@ -141,7 +142,7 @@ public class ModelsActivity extends Base {
     }
 
     void begin(String base, Models.Item it, boolean needCommon) {
-        long need = it.size + (needCommon ? store.commonSize : 0);
+        long need = it.size + (needCommon ? store.commonBytes() : 0);
         if (getFilesDir().getUsableSpace() < need + 300_000_000L) { Toast.makeText(this, L.f("Не хватает места: нужно %s ГБ", "Not enough space: need %s GB", gb(need)), Toast.LENGTH_LONG).show(); return; }
         if (downloading) return;
         downloading = true; dlId = it.id; dlDone = 0; dlTotal = need; dlMsg = L.s("Подключаюсь…", "Connecting…"); cancel.set(false);

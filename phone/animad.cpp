@@ -10,6 +10,7 @@
 #include <functional>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <csignal>
 #include <unistd.h>
 
 #include <algorithm>
@@ -318,6 +319,17 @@ static std::string waitline(Chain& c, const char* a, const char* b) {
     die("chainrun exited");
     return "";
 }
+// like waitline(c, "ready"), but a helper that exits or reports an error returns false instead of ending animad (megarun: "error hmx" = HMX self-test failed)
+static bool waitready(Chain& c) {
+    char line[4096];
+    while (fgets(line, sizeof line, c.out)) {
+        if (!strncmp(line, "ready", 5)) return true;
+        if (!strncmp(line, "error", 5)) { fprintf(stderr, "animad: helper: %s", line); break; }
+        if (strstr(line, "ERROR") || strstr(line, "failed") || strstr(line, "FAILED")) fprintf(stderr, "chainrun: %s", line);
+    }
+    fclose(c.in); fclose(c.out); kill(c.pid, SIGTERM); waitpid(c.pid, nullptr, 0);
+    return false;
+}
 
 int main(int argc, char** argv) {
     if (argc < 3) die("usage: animad SMALL.bin DIR [STEPS|--adapter N] [PH]");
@@ -348,18 +360,27 @@ int main(int argc, char** argv) {
             std::vector<int> cnt = {10, 10, 8}; if (nblk == 40) cnt = {10, 10, 10, 10};
             if (const char* g = getenv("ANIMAD_HMXG")) { cnt.clear(); for (const char* p = g; *p;) { cnt.push_back(atoi(p)); while (*p && *p != ',') p++; if (*p) p++; } }
             int f0 = 0; for (int c : cnt) { ch.push_back(spawn_mega(ph, f0, c, hd)); f0 += c; }
+            // a megarun whose HMX self-test fails (or that dies while loading) is started again, at most twice, after a pause: a fresh process gets a
+            // fresh DSP session, and a run interrupted just before may still be releasing the HMX
+            f0 = 0;
+            for (size_t i = 0; i < ch.size(); f0 += cnt[i], i++) {
+                bool ok = waitready(ch[i]);
+                for (int a = 0; !ok && a < 2; a++) { fprintf(stderr, "animad: restarting megarun %d\n", f0); usleep(1500000); ch[i] = spawn_mega(ph, f0, cnt[i], hd); ok = waitready(ch[i]); }
+                if (!ok) die("megarun failed (HMX self-test or load)");
+            }
         }   // one DSP process maps at most ~13 of the 126 MB weight buffers
         else if (grp) { ch.push_back(spawn(ph, 0, 4, "q4")); ch.push_back(spawn(ph, 4, 3, "q4")); }  // one DSP session holds only 4 of these (0x3ea at the 5th)
         else { int rg[3][2] = {{0, 10}, {10, 10}, {20, 8}}; for (auto& r : rg) ch.push_back(spawn(ph, r[0], r[1], ".")); }
-        for (auto& c : ch) waitline(c, "ready", nullptr);
-        if (serve || getenv("SD_VAE_DIR")) { vae.push_back(spawn_vae(ph)); waitline(vae[0], "ready", nullptr); }
+        if (!hmx) for (auto& c : ch) waitline(c, "ready", nullptr);
+        // NPU decoder only when its QNN context is installed (chips without QNN contexts, e.g. V81: sd.cpp decodes on the CPU, the app sends v=0)
+        if ((serve || getenv("SD_VAE_DIR")) && !access((ph + "/vae.bin").c_str(), F_OK) && !getenv("ANIMAD_NOVAE")) { vae.push_back(spawn_vae(ph)); waitline(vae[0], "ready", nullptr); }
         if (serve && !access((ph + "/te3.bin").c_str(), F_OK) && !access((ph + "/te_embed.f16").c_str(), F_OK)) {
             int fd = open((ph + "/te_embed.f16").c_str(), O_RDONLY);
             embed = (const __fp16*)mmap(nullptr, (size_t)151936 * 1024 * 2, PROT_READ, MAP_SHARED, fd, 0);
             if (embed == MAP_FAILED) embed = nullptr;
             if (embed) { te.push_back(spawn_te(ph)); waitline(te[0], "ready", nullptr); }
         }
-        fprintf(stderr, "animad: chain ready %.1fs (text encoder on NPU: %s)\n", now() - t0, te.empty() ? "no" : "yes");
+        fprintf(stderr, "animad: chain ready %.1fs (text encoder on NPU: %s, decoder on NPU: %s)\n", now() - t0, te.empty() ? "no" : "yes", vae.empty() ? "no" : "yes");
     }
     auto handle = [&](const std::string& dir, int steps, const std::string& vd) {
     std::vector<f32> ctx512;  // adapter output [512,1024]

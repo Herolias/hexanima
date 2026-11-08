@@ -38,7 +38,15 @@ final class Models {
         return c;
     }
 
-    long commonSize;
+    long commonSize;   // shared files of the QNN pipeline (catalog); see commonBytes() for the CPU text-encoder pipeline
+    /** the full Qwen3 0.6B text encoder for the CPU path: the stock Anima file (same header and weights as the MiaoMiao packs' text encoder, checked byte for byte
+     *  on the header and on the embedding table), saved under its own name so a sparse stub from a QNN install is never mistaken for it */
+    static final String TE_FILE = "qwen_3_06b_base.safetensors";
+    static final String TE_URL = "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/text_encoders/" + TE_FILE;
+    static final long TE_SIZE = 1192135096L;
+    static final String TE_SHA = "cd2a512003e2f9f3cd3c32a9c3573f820bb28c940f73c57b1ddaa983d9223eba";
+    static final long TAE_SIZE = 22642902L;
+    long commonBytes() { return Compat.qnnCommon() || Compat.dspArch().isEmpty() ? commonSize : TE_SIZE + TAE_SIZE; }
     List<Item> catalog(String base) throws Exception {
         String txt;   // catalog2.json lists the Anima models and MOSS-Image (1.3+); catalog.json stays as is for older apps, which would misread a MOSS entry
         try { txt = get(base + "catalog2.json"); } catch (Exception e) { txt = get(base + "catalog.json"); }
@@ -59,7 +67,8 @@ final class Models {
     File modelDir(String id) { return Moss.is(id) ? Moss.dir(home) : new File(anima, "m_" + id); }
     File doneMark(File dir) { return new File(dir, ".installed"); }
     boolean modelInstalled(String id) { if (Moss.is(id)) return Moss.installed(home) && id.equals(mossId()); return commonInstalled() && doneMark(modelDir(id)).exists() && new File(sd, id + ".safetensors").exists(); }
-    /** v69 keeps the original "common" folder (older apps use it); other Hexagon generations have their own QNN contexts in common_<arch> */
+    /** v69 keeps the original "common" folder (older apps use it); other Hexagon generations have their own QNN contexts in common_<arch>,
+     *  or (no QNN contexts for that generation, e.g. v81) only a local marker folder: the CPU text encoder and the TAEHV decoder are fetched instead */
     static String commonDir() { String a = Compat.dspArch(); return a.isEmpty() || a.equals("v69") ? "common" : "common_" + a; }
     boolean commonInstalled() { return doneMark(new File(anima, commonDir())).exists(); }
     String mossId() { try { return new JSONObject(read(new File(Moss.dir(home), "meta.json"))).getString("id"); } catch (Exception e) { return ""; } }
@@ -87,6 +96,7 @@ final class Models {
     // ---- install --------------------------------------------------------------------------------
     void installCommon(String base, Progress pg, AtomicBoolean cancel) throws Exception {
         if (commonInstalled()) return;
+        if (!Compat.qnnCommon() && !Compat.dspArch().isEmpty()) { installCommonCpu(base, pg, cancel); return; }
         JSONObject m = new JSONObject(get(base + commonDir() + "/manifest.json"));
         File marker = new File(anima, commonDir()); marker.mkdirs();
         long total = total(m.getJSONArray("files")) + total(m.getJSONArray("sd"));
@@ -97,6 +107,20 @@ final class Models {
         File hdr = new File(marker, "llm_hdr.bin");
         fetch(base + commonDir() + "/" + llm.getString("hdr"), hdr, llm.optLong("hdr_size", -1), llm.optString("hdr_sha256", null), null, cancel);
         stub(hdr, new File(sd, llm.getString("name")), llm.getLong("size"));
+        doneMark(marker).createNewFile();
+    }
+
+    /** no QNN contexts for this Hexagon generation: sd.cpp runs the text encoder and the TAEHV decoder on the CPU, so the real text encoder weights
+     *  (1.2 GB, from the Anima repository) and taew2_1.safetensors (from the v69 common pack) are all that is shared; nothing else of "common" is needed */
+    void installCommonCpu(String base, Progress pg, AtomicBoolean cancel) throws Exception {
+        JSONObject m = new JSONObject(get(base + "common/manifest.json"));
+        JSONArray sdf = m.getJSONArray("sd");
+        File marker = new File(anima, commonDir()); marker.mkdirs();
+        long total = TE_SIZE + total(sdf);
+        long[] done = {0};
+        fetchAll(base + "common/", sdf, sd, total, done, pg, cancel);
+        final long before = done[0];
+        fetch(TE_URL, new File(sd, TE_FILE), TE_SIZE, TE_SHA, n -> { if (pg != null) pg.on(before + n, total, TE_FILE); }, cancel);
         doneMark(marker).createNewFile();
     }
 

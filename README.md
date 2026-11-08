@@ -15,6 +15,15 @@ A 512x768 picture takes about **7 s** with the 2B models and **12 s** with the 2
 It can also run **MOSS-Image 5B** (OpenMOSS, Apache-2.0), a larger model that you prompt with plain sentences. Its text encoder (Qwen3.5-9B), the transformer and the decoder all run on the NPU:
 about 30 s for 512x768 and about 80 s for 1 Mpx; any size with sides that are multiples of 16 (up to 6144 patches). It is an optional ~14 GB download.
 
+> **This fork** adds experimental support for the **Snapdragon 8 Elite Gen 5** (SM8850, Hexagon V81, e.g. Xiaomi 17 Pro Max), branch `port/v81-sm8850`.
+> The diffusion transformer runs on the NPU with the same HMX kernels as on V69. The text encoder and the decoder run on the CPU through sd.cpp,
+> because Qualcomm's QNN context binaries are compiled per Hexagon generation and none exists for V81.
+> It also adds a startup HMX self-test with automatic restart, and a clean stop (SIGTERM, then SIGKILL) so the matrix unit is never left locked by a killed helper:
+> those were the two failure modes that got 8 Elite (V79) support withdrawn upstream. There are new settings for speed and quality: best quality
+> (every step at full resolution), CPU threads, NPU worker threads, and large sizes. Sizes above 4096 patches stay off until they are verified on the device. MOSS-Image is
+> hidden on V81, because its decoder needs a QNN context. Build: `tools/build_fork.sh` (podman or docker, host Android SDK; no QNN SDK needed, and the
+> unchanged native libraries come from the upstream release APK). **Status: built, not yet verified on a V81 phone.**
+
 ## Features
 
 - Fully offline after the models are downloaded; nothing leaves the phone.

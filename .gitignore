@@ -20,3 +20,4 @@ work/
 *.safetensors
 __pycache__/
 app/assets/anima.sh
+build_fork/

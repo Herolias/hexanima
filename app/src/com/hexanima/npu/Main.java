@@ -69,7 +69,7 @@ public class Main extends Base {
     File lastFile;
     boolean customOpen;
 
-    String mp() { return "MID=" + model + " MDIR=m_" + model + " IDLE=" + Settings.idleMin(this) * 60 + " "; }
+    String mp() { return "MID=" + model + " MDIR=m_" + model + " IDLE=" + Settings.idleMin(this) * 60 + " " + Compat.env(this); }
 
     GradientDrawable gradient(boolean enabled) {
         GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[]{enabled ? ACC : 0xFF3A4158, enabled ? ACC2 : 0xFF3A4158});
@@ -564,7 +564,12 @@ public class Main extends Base {
 
     boolean isMoss() { return Moss.is(model); }
     /** the size presets of the selected model: Anima's list, or MOSS-Image's own presets (any size with sides multiple of 16 works) */
-    java.util.List<int[]> sizeList() { return java.util.Arrays.asList(isMoss() ? Moss.PRESETS : SIZES); }
+    java.util.List<int[]> sizeList() {
+        if (isMoss()) return java.util.Arrays.asList(Moss.PRESETS);
+        java.util.List<int[]> l = new java.util.ArrayList<>(); int max = Compat.maxPatches(this);   // chips other than V69: only the verified sizes unless "large sizes" is on (Settings)
+        for (int[] z : SIZES) if ((z[0] / 16) * (z[1] / 16) <= max) l.add(z);
+        return l;
+    }
     String mossSizeError(int w, int h) { return Moss.sizeError(w, h); }
 
     // ---- model state --------------------------------------------------------------------------
@@ -579,13 +584,14 @@ public class Main extends Base {
         builder().setTitle(L.s("Модель", "Model")).setItems(names, (d, i) -> { if (i < ids.size()) setModel(ids.get(i)); else openModels(); }).show();
     }
 
-    /** The NPU pipeline needs width/height multiples of 16, patch count divisible by 32 and at most 6144 patches (megarun TMAX). */
-    static String sizeError(int w, int h) {
+    /** The NPU pipeline needs width/height multiples of 16, patch count divisible by 32 and at most 6144 patches (megarun TMAX; 4096 on unverified chips unless enabled in Settings). */
+    String sizeError(int w, int h) {
         if (w < 256 || h < 256) return L.s("Размер: минимум 256 по каждой стороне", "Size: at least 256 on each side");
         if (w % 16 != 0 || h % 16 != 0) return L.s("Ширина и высота должны быть кратны 16", "Width and height must be multiples of 16");
         int t = (w / 16) * (h / 16);
         if (t % 32 != 0) return L.f("Число патчей (%d) должно делиться на 32, например 640×640, 1024×1024, 704×832", "Patch count (%d) must be divisible by 32, e.g. 640×640, 1024×1024, 704×832", t);
         if (t > 6144) return L.s("Слишком большой размер: максимум 6144 патча (например 1536×960)", "Too large: at most 6144 patches (e.g. 1536×960)");
+        if (t > Compat.maxPatches(this)) return L.f("На этом чипе проверено до %d патчей (например 1024×1024); большие размеры включаются в настройках", "On this chip sizes are verified up to %d patches (e.g. 1024×1024); larger sizes can be enabled in Settings", Compat.maxPatches(this));
         return null;
     }
 
