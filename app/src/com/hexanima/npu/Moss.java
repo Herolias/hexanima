@@ -27,13 +27,14 @@ final class Moss {
             + (nw > 0 ? "MOSS_NW=" + nw + " " : "") + (keep > 0 ? "MOSS_KEEP=" + keep + " " : "");
     }
     /** rough seconds per picture: V81 measured ~38 s at 1024x1024 (4 steps, 6 workers) plus a few seconds of text encoder / decoder; elsewhere the catalog speed (512x768) scaled by patches.
-     *  Full mode: one DiT pass per step, two with CFG (the negative branch skips one of the 42 blocks), plus the negative prompt's text encoder on its first use. */
+     *  Full mode: one DiT pass per step, two with CFG, plus the negative prompt's text encoder on its first use. */
     static long estimate(int speed512x768, int w, int h, boolean full, int steps, float cfg) {
-        double p = (w / 16) * (h / 16), passes = full ? steps * (cfg != 1f ? 1.98 : 1.0) : 4;
+        double p = (w / 16) * (h / 16), passes = full ? steps * (cfg != 1f ? 2.0 : 1.0) : 4;
         return Math.round(Compat.qnn243() ? (full ? 6 : 4) + 8.5 * passes * p / 4096 : speed512x768 * p / 1536.0 * passes / 4);
     }
 
-    /** full model (rapid-moss adapter off) with the official MOSS sampler: FlowMatch Euler on the shift-5 schedule, CFG with a negative prompt (block 22 skipped in that branch) */
+    /** full model (rapid-moss adapter off) sampled like Unsloth Studio does MOSS-Image-SFT: FlowMatch Euler on ComfyUI's sgm_uniform shift-5 schedule, plain CFG with
+     *  a negative prompt (the reference pipeline's block-22 skip in the negative branch makes SFT pictures smooth and airbrushed) */
     static final int FULL_STEPS_MIN = 8, FULL_STEPS_MAX = 60, FULL_STEPS_DEF = 20;
     static final float CFG_DEF = 3f;
     /** the SFT model's own time embedding (glue.bin carries the adapter's): files/moss/glue_base.bin from moss/export_glue_base.py; null = fine */

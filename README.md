@@ -33,12 +33,14 @@ about 30 s for 512x768 and about 80 s for 1 Mpx; any size with sides that are mu
 >   exactly into the same 8-bit tiles (same size and speed); the published pack comes from UD-Q5_K_XL (q/k 4%, o 2% weight error). Block-level check of the V81
 >   kernels against the PyTorch reference (moss/mkblk_test.py + cmp_blk.py, block 20 at 512x768): q/k/v/o/FFN/output within 0.03-0.09%.
 > - **MOSS-Image full-model mode** (main screen: *Fast · 4 steps* / *Full model*): the rapid-moss adapter is switched off (its LoRA-A matrices are zeroed after
->   each block read) and mossrun runs the official MOSS sampler from `pipeline_moss_image.py`: FlowMatch Euler on the shift-5 schedule snapped to the training grid
->   (same lengths and sigmas within 6e-8 of the reference scheduler for 1-100 steps), CFG with a negative prompt, block 22 skipped in the negative branch.
+>   each block read) and mossrun samples the way Unsloth Studio runs MOSS-Image-SFT: FlowMatch Euler on ComfyUI's `sgm_uniform` shift-5 schedule, plain CFG
+>   with a negative prompt. `pipeline_moss_image.py`'s own defaults (schedule snapped to the training grid, block 22 skipped in the negative branch) are kept
+>   behind `MOSS_FULL="full CFG NEG 5 reference"`: on the SFT model that skip gives smooth, airbrushed faces (`moss/sampler_gpu.py`, same seed and noise on a desktop GPU: mean gradient
+>   3.6 with the skip, 4.3 without, i.e. visibly more skin and hair detail; the schedule alone changes little).
 >   Steps 8-60, CFG 1-8, negative prompt; the settings go into the PNG. Both branches run through each DiT block before the next one is read, so the weights are still
 >   streamed once per step. Speed on the 8 Elite Gen 5: ~1.6 s per DiT pass at 512x512, ~8.5 s at 1024x1024 (rising to ~10 s as the phone warms up): 20 steps
 >   with CFG at 1024x1024 took 6.6 min.
->   Checked against the fp32 PyTorch reference (`moss/check_full.py` on a `MOSS_DUMP` of a phone run, 512x512, 8 steps, CFG 3): every step's velocities, recomputed
+>   Checked against the fp32 PyTorch reference (`moss/check_full.py` on a `MOSS_DUMP` of a phone run, 512x512, 8 steps, CFG 3, reference settings): every step's velocities, recomputed
 >   on the phone's own latents, within 0.03-0.32% (both branches); CFG compounds these fp16-level differences to ~7% in the final latent, which decodes to the
 >   same picture (`moss/decode_cmp.py`: mean pixel difference 2 of 255). Runs are bit-reproducible for a seed.
 >   Needs `files/moss/glue_base.bin` (the SFT model's own time embedding, `moss/export_glue_base.py`). Classic LoRAs are folded a second time without the adapter
@@ -46,8 +48,14 @@ about 30 s for 512x768 and about 80 s for 1 Mpx; any size with sides that are mu
 > - **Adapter precision**: the rapid-moss LoRA's trained factors cancel heavily (|BA| is ~9% of |B||A|), so storing them as trained in 8-bit tiles lost 6-10% of
 >   its delta. `export_moss.py` and `lorafold` now store every rank-128 slot as B' = U sqrt(S), A' = sqrt(S) V^T (same product): 1-2.4% error over all 42 blocks,
 >   base weights byte-identical. Same seed in Fast mode: same picture, finer details differ (mean pixel difference 9 of 255).
+> - **8-bit text encoder**: CFG amplifies text-side error, and the 4-bit Qwen3.5-9B (Unsloth UD-Q4_K_XL) was ~6% off an 8-bit (Q8_0) reference on the refined
+>   prompt (`moss/te_cmp.py`: ~5% from the 4-bit weights, ~3% from the NPU kernels). In full mode that showed up as broken anatomy (limbs out of place, merged fingers):
+>   the same seed with the PC's 8-bit text injected came out clean. `moss/export_te_all.py` with `TE_GGUF=Qwen3.5-9B-Q8_0.gguf` repacks every matrix exactly into
+>   8-bit tiles (7.6 GB in `te/`, largest layer 246 MB, still fits mossrun's 250 MB stream buffer) plus `embd.q8` (the Q8_0 token table, 1.08 GB); mossrun uses
+>   `embd.q8` when it is present and keys its text caches apart. Decoder ruled out: the FLUX.2 small decoder and the full FLUX.2-klein VAE decode the same latent
+>   to the same sharpness.
 > - **Open**: the V81 context binaries and `glue_base.bin` are not hosted anywhere yet, so they are copied into the app with `adb` (`files/anima/{te0..te3,vae}.bin,
->   te_embed.f16`, `files/vae81/vae_WxH.bin`, `files/moss/glue_base.bin`); sizes above 4096 patches are unverified on V81; full mode is untested on V69.
+>   te_embed.f16`, `files/vae81/vae_WxH.bin`, `files/moss/glue_base.bin`, the 8-bit `files/moss/te/` + `embd.q8`); sizes above 4096 patches are unverified on V81; full mode is untested on V69.
 
 ## Features
 

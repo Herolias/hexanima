@@ -4,7 +4,8 @@
 #   moss.sh stop                                  kill the helpers
 # env: M (model dir, files/moss: glue.bin embd.q4k te/ ref/ dit/ vae/vae_<W>x<H>.bin), BIN (the app's native lib dir),
 #      VAED (decoder contexts, default $M/vae; files/vae81 on Hexagon V81), QH / QS (QNN HTP / System runtime in $BIN: libQnnHtp243.so / libQnnSystem243.so on V81),
-#      MOSS_FULL ("full CFG NEG_IDS_FILE [SHIFT]": the full model with the official sampler instead of the 4-step adapter; STEPS up to 100, needs $M/glue_base.bin)
+#      MOSS_FULL ("full CFG NEG_IDS_FILE [SHIFT [studio|reference]]": the full model with CFG instead of the 4-step adapter, Unsloth Studio's sampler settings
+#      unless "reference" (pipeline_moss_image.py defaults); STEPS up to 100, needs $M/glue_base.bin)
 # The MOSS DSP skel has the same file name as Anima's (libmega_skel.so): it is copied to $M/dsp and that dir comes first in ADSP_LIBRARY_PATH.
 if [ "$1" = stop ]; then for p in libmossrun.so libvaerun.so libvaetile.so; do pidof $p >/dev/null && kill -9 $(pidof $p); done; exit 0; fi
 IDS=$1 W=$2 H=$3 SEED=$4 STEPS=$5 OUT=$6

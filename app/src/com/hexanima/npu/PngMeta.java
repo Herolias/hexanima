@@ -10,7 +10,9 @@ final class PngMeta {
     static byte[] embed(byte[] png, JSONObject m) {
         try {
             String prompt = m.optString("prompt");
-            String params = prompt + "\nSteps: 4, Sampler: Euler, CFG scale: 1, Seed: " + m.optString("seed") + ", Size: " + m.optInt("w") + "x" + m.optInt("h") + ", Model: " + m.optString("model");
+            String neg = m.optString("negative", "");   // MOSS full mode carries its own steps / CFG / negative prompt
+            String params = prompt + (neg.isEmpty() ? "" : "\nNegative prompt: " + neg) + "\nSteps: " + m.optInt("steps", 4) + ", Sampler: Euler, CFG scale: "
+                + String.format(java.util.Locale.US, "%.4g", m.optDouble("cfg", 1.0)) + ", Seed: " + m.optString("seed") + ", Size: " + m.optInt("w") + "x" + m.optInt("h") + ", Model: " + m.optString("model");
             ByteArrayOutputStream o = new ByteArrayOutputStream();
             o.write(png, 0, 33);   // signature + IHDR (8 + 25 bytes)
             chunk(o, "anima", m.toString()); chunk(o, "parameters", params);

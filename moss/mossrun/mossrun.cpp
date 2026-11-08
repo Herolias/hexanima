@@ -3,11 +3,13 @@
 // The VAE (FLUX.2 decoder, QNN context) is run by vaerun on the z file written here.
 // stdin:  "load MODELDIR"                         read glue + DiT packs (resident), prints "loaded <s>"
 //         "gen IDS.i32 H W SEED STEPS OUT.z"      prints "step i <ms>" lines and "done <ms>"; OUT = fp32 [32][H/8][W/8] (BN-denormalised, unpatchified)
-//         "gen IDS.i32 H W SEED STEPS OUT.z full CFG NEG.i32 [SHIFT]"   full model: rapid-moss adapter off, the official MOSS sampler (FlowMatch Euler on the
-//                                                 shift-5 schedule snapped to the training grid), CFG with the negative prompt NEG (block 22 skipped in that branch);
-//                                                 prints "schedule N" first (snapping could merge steps; it does not for 1..100); needs MODELDIR/glue_base.bin
+//         "gen IDS.i32 H W SEED STEPS OUT.z full CFG NEG.i32 [SHIFT [studio|reference]]"   full model: rapid-moss adapter off, FlowMatch Euler, CFG with the
+//                                                 negative prompt NEG. studio (default) = Unsloth Studio's MOSS-Image-SFT settings: ComfyUI's sgm_uniform shift-5
+//                                                 schedule, no block skipped in the negative branch; reference = pipeline_moss_image.py's defaults: shift-5 schedule
+//                                                 snapped to the training grid, block 22 skipped in the negative branch (on the SFT model that gives a smooth,
+//                                                 airbrushed look). Prints "schedule N" first; needs MODELDIR/glue_base.bin
 //         "quit"
-// MODELDIR: glue.bin embd.q4k te/te00..te32.bin ref/{proj,ref0,ref1}.bin dit/blk00..blk41.bin [glue_base.bin: the SFT model's own time MLP + modulation biases]
+// MODELDIR: glue.bin embd.q4k (or embd.q8: Q8_0 rows, used when present) te/te00..te32.bin ref/{proj,ref0,ref1}.bin dit/blk00..blk41.bin [glue_base.bin: the SFT model's own time MLP + modulation biases]
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -169,6 +171,10 @@ static void q4k_row(const uint8_t* row, f32* out) {   // 4096 values = 16 super-
   }
 }
 
+static void q8_0_row(const uint8_t* row, f32* out) {   // 4096 values = 128 Q8_0 blocks of 34 bytes (fp16 d, 32 x int8)
+  for (int b = 0; b < 128; b++) { const uint8_t* p = row + b * 34; __fp16 dh; memcpy(&dh, p, 2); const float d = (float)dh; for (int i = 0; i < 32; i++) out[b * 32 + i] = d * (float)(int8_t)p[2 + i]; }
+}
+
 // ------------------------------------------------------------------ tile helpers
 // rows [nrows][cols] fp32 -> x32 tiles [slab][cb][32][32]
 static void rows_to_x32(const f32* rows, int nrows, int cols, f32* x32, int ns) {
@@ -188,7 +194,7 @@ static void x32_to_rows(const f32* x32, int nrows, int cols, f32* rows) {
 
 // ------------------------------------------------------------------ state
 static remote_handle64 g_h = 0;
-static Glue g_glue; static uint8_t* g_embd = nullptr; static size_t g_embd_len = 0; static std::string g_dir;
+static Glue g_glue; static uint8_t* g_embd = nullptr; static size_t g_embd_len = 0; static bool g_embd_q8 = false; static std::string g_dir;
 static std::vector<Buf*> g_dit;         // 42 block packs, resident in rpcmem, mapped on demand
 static Buf g_te[2], *g_tep[2];                     // streaming pack buffers (TE layers, refiner packs)
 static Buf g_blobTE; static Layout g_LT;  // TE + refiner blob (capacity MAXT tokens, hid 4096)
@@ -228,7 +234,7 @@ static bool encode_text(const std::vector<int>& ids, std::vector<f32>& tx) {
   double t0 = now();
   // embeddings -> x32 (4096 wide)
   std::vector<f32> emb((size_t)T * 4096);
-  par_for(T, [&](int i) { q4k_row(g_embd + (size_t)ids[i] * 2304, &emb[(size_t)i * 4096]); });
+  par_for(T, [&](int i) { if (g_embd_q8) q8_0_row(g_embd + (size_t)ids[i] * 4352, &emb[(size_t)i * 4096]); else q4k_row(g_embd + (size_t)ids[i] * 2304, &emb[(size_t)i * 4096]); });
   rows_to_x32(emb.data(), T, 4096, (f32*)(blob + L.meta[M_X]), ns);
   { f32* cs = (f32*)(blob + L.meta[M_CS]); memset(cs, 0, (size_t)ntokT * 64 * 4);
     for (int t = 0; t < T; t++) for (int i = 0; i < 32; i++) { const double a = t * pow(1e7, -(double)i / 32); cs[t * 64 + i] = (f32)cos(a); cs[t * 64 + 32 + i] = (f32)sin(a); } }
@@ -279,7 +285,8 @@ static void time_vecs(float code, std::vector<f32>& mod, std::vector<f32>& head,
 }
 
 // ------------------------------------------------------------------ DiT sampler
-static uint64_t ids_hash(const std::vector<int>& ids) { uint64_t h = 1469598103934665603ull ^ 0x4d4f5353ull; for (int v : ids) { h ^= (uint32_t)v; h *= 1099511628211ull; } return h; }
+// the 8-bit encoder (embd.q8) gets its own cache keys
+static uint64_t ids_hash(const std::vector<int>& ids) { uint64_t h = 1469598103934665603ull ^ 0x4d4f5353ull ^ (g_embd_q8 ? 0x5138ull << 32 : 0); for (int v : ids) { h ^= (uint32_t)v; h *= 1099511628211ull; } return h; }
 static bool load_tx(const std::vector<int>& ids, std::vector<f32>& tx, const char* name = "tx.cache") {   // the text side depends on the prompt only: reuse it for the next seed / picture
   FILE* f = fopen((g_dir + "/" + name).c_str(), "rb"); if (!f) return false;
   uint64_t h = 0; int T = 0; bool ok = fread(&h, 8, 1, f) == 1 && fread(&T, 4, 1, f) == 1 && h == ids_hash(ids) && T == (int)ids.size();
@@ -380,6 +387,13 @@ static std::vector<float> moss_sigmas(int steps, double shift) {   // MOSSImageS
     const float v = fabsf(s - tr[lo]) <= fabsf(tr[up] - s) ? tr[lo] : tr[up]; if (out.empty() || out.back() != v) out.push_back(v); }
   return out;
 }
+static std::vector<float> sgm_sigmas(int steps, double shift) {   // Unsloth Studio's default (diffusion_moss_image.sgm_uniform_sigmas = ComfyUI sgm_uniform over
+  // ModelSamplingDiscreteFlow, multiplier 1): linspace(sigma_max, sigma_min, steps + 1)[:-1] in timestep space, re-shifted; the sampler appends sigma 0
+  const float s = (float)shift, s1 = (float)(shift - 1); auto sh = [&](float t) { return s * t / (1.f + s1 * t); };
+  std::vector<float> ts = lin32(sh(1.f), sh(1.f / 1000.f), steps + 1); ts.pop_back();
+  for (auto& t : ts) t = sh(t);
+  return ts;
+}
 static void embed_latent(const f32* lat, int Ni, f32* rows) {   // video_embedder: [128][Ni] -> rows [Ni][3072]
   const f32* Wemb = g_glue.f("video_embedder.weight"); const f32* bemb = g_glue.f("video_embedder.bias");
   par_for(Ni / 16 + 1, [&](int blk) { for (int t = blk * 16; t < std::min(Ni, blk * 16 + 16); t++) {
@@ -396,9 +410,9 @@ static void head_velocity(f32* outrows, int Ni, const std::vector<f32>& head, f3
 static void dump(const char* name, const void* p, size_t bytes) {   // MOSS_DUMP=dir: sampler inputs/outputs for the PC reference (moss/check_full.py)
   const char* d = getenv("MOSS_DUMP"); if (!d) return; FILE* f = fopen((std::string(d) + "/" + name).c_str(), "wb"); if (!f) return; fwrite(p, 1, bytes, f); fclose(f);
 }
-static bool generate_full(const std::vector<int>& ids, const std::vector<int>& nids, int Hpx, int Wpx, unsigned seed, int steps, float cfg, double shift, const std::string& outz) {
+static bool generate_full(const std::vector<int>& ids, const std::vector<int>& nids, int Hpx, int Wpx, unsigned seed, int steps, float cfg, double shift, bool reference, const std::string& outz) {
   if (!g_haveB) { fprintf(stderr, "full mode needs %s/glue_base.bin\n", g_dir.c_str()); return false; }
-  const int SKIP = 22;   // uncond_skip_layers=(22,): the negative branch runs without block 22 (the official default, for the whole schedule)
+  const int SKIP = reference ? 22 : -1;   // reference: uncond_skip_layers=(22,) for the whole schedule; Studio skips nothing on the SFT model
   double tall = now(); const bool cfgon = cfg != 1.f && !nids.empty();
   std::vector<f32> tx, tn;
   if (load_tx(ids, tx)) fprintf(stderr, "te: cached\n"); else { if (!encode_text(ids, tx)) return false; save_tx(ids, tx); }
@@ -419,11 +433,11 @@ static bool generate_full(const std::vector<int>& ids, const std::vector<int>& n
   { std::vector<f32> bands(16); for (int i = 0; i < 16; i++) bands[i] = g_glue.f("rope.bands")[i];   // rope depends on the text length (image tokens sit at coordinate T)
     rope_tables(bands.data(), H, W, T, ntc, (f32*)(blob + L.meta[M_COS]), (f32*)(blob + L.meta[M_SIN]));
     if (cfgon) rope_tables(bands.data(), H, W, Tn, ntu, (f32*)(blob + g_c2), (f32*)(blob + g_s2)); }
-  const std::vector<float> sg = moss_sigmas(steps, shift); const int S = (int)sg.size();
+  const std::vector<float> sg = reference ? moss_sigmas(steps, shift) : sgm_sigmas(steps, shift); const int S = (int)sg.size();
   printf("schedule %d\n", S); fflush(stdout);   // not "step..": the app counts lines starting with "step" as finished steps
   std::vector<f32> x((size_t)128 * Ni), vc((size_t)128 * Ni), vu(cfgon ? (size_t)128 * Ni : 0);
   { std::mt19937 gen(seed); std::normal_distribution<float> nd(0.f, 1.f); for (auto& a : x) a = nd(gen); }
-  dump("z.bin", x.data(), x.size() * 4); dump("tx.bin", tx.data(), tx.size() * 4); if (cfgon) dump("tn.bin", tn.data(), tn.size() * 4); dump("sig.bin", sg.data(), sg.size() * 4);
+  dump("z.bin", x.data(), x.size() * 4); dump("tx.bin", tx.data(), tx.size() * 4); if (cfgon) dump("tn.bin", tn.data(), tn.size() * 4); dump("sig.bin", sg.data(), sg.size() * 4); dump("skip.bin", &SKIP, 4);
   std::vector<f32> rows((size_t)(Ni + std::max(T, Tn)) * 3072), outrows((size_t)Ni * 3072), modv, head;
   std::vector<std::string> df; for (int k = 0; k < NLAYER_DIT; k++) { char p[512]; snprintf(p, sizeof p, "%s/dit/blk%02d.bin", g_dir.c_str(), k); df.push_back(p); }
   g_full = true;
@@ -476,7 +490,8 @@ int main(int argc, char** argv) {
       ss >> g_dir; double t0 = now();
       if (!g_glue.load(g_dir + "/glue.bin")) { printf("error glue\n"); continue; }
       g_haveB = access((g_dir + "/glue_base.bin").c_str(), R_OK) == 0 && g_glueB.load(g_dir + "/glue_base.bin");
-      { int fd = open((g_dir + "/embd.q4k").c_str(), O_RDONLY); if (fd < 0) { printf("error embd\n"); continue; } struct stat st; fstat(fd, &st); g_embd_len = st.st_size; g_embd = (uint8_t*)mmap(nullptr, g_embd_len, PROT_READ, MAP_PRIVATE, fd, 0); close(fd); }
+      { g_embd_q8 = access((g_dir + "/embd.q8").c_str(), R_OK) == 0;   // the 8-bit text encoder (te/ from Qwen3.5-9B-Q8_0) comes with its Q8_0 token table
+        int fd = open((g_dir + (g_embd_q8 ? "/embd.q8" : "/embd.q4k")).c_str(), O_RDONLY); if (fd < 0) { printf("error embd\n"); continue; } struct stat st; fstat(fd, &st); g_embd_len = st.st_size; g_embd = (uint8_t*)mmap(nullptr, g_embd_len, PROT_READ, MAP_PRIVATE, fd, 0); close(fd); }
       g_te[0] = make_buf(TE_BUF); g_te[1] = make_buf(TE_BUF); g_all.push_back(&g_te[0]); g_all.push_back(&g_te[1]); if (!g_te[0].p || !g_te[1].p) { printf("error tebuf\n"); continue; }
       g_LT = make_layout(MAXT, 4096, 12288, true); g_blobTE = make_buf(g_LT.total, true); if (!g_blobTE.p) { printf("error teblob\n"); continue; } memset(g_blobTE.p, 0, g_LT.total);
       { long long avail = 0; FILE* mi = fopen("/proc/meminfo", "r"); char ln[256]; while (mi && fgets(ln, sizeof ln, mi)) if (!strncmp(ln, "MemAvailable:", 13)) avail = atoll(ln + 13) * 1024; if (mi) fclose(mi);
@@ -487,14 +502,15 @@ int main(int argc, char** argv) {
       printf("loaded %.1f\n", now() - t0); continue;
     }
     if (cmd == "gen") {
-      std::string idsf, outz, mode, negf; int H, W, steps; unsigned seed; float cfg = 1.f; double shift = 5.0; ss >> idsf >> H >> W >> seed >> steps >> outz >> mode;
-      const bool full = mode == "full"; if (full) { ss >> cfg >> negf; double sh; if (ss >> sh) shift = sh; }
+      std::string idsf, outz, mode, negf, sampler; int H, W, steps; unsigned seed; float cfg = 1.f; double shift = 5.0; ss >> idsf >> H >> W >> seed >> steps >> outz >> mode;
+      const bool full = mode == "full"; if (full) { ss >> cfg >> negf; double sh; if (ss >> sh) { shift = sh; ss >> sampler; } }
+      if (!sampler.empty() && sampler != "studio" && sampler != "reference") { printf("error sampler\n"); continue; }
       auto read_ids = [](const std::string& fn, std::vector<int>& v) { FILE* f = fopen(fn.c_str(), "rb"); if (!f) return false; fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
         v.resize(n / 4); const bool ok = fread(v.data(), 4, v.size(), f) == v.size(); fclose(f); return ok; };
       std::vector<int> ids, nids; if (!read_ids(idsf, ids)) { printf("error ids\n"); continue; }
       if (full && cfg != 1.f && (negf.empty() || !read_ids(negf, nids) || nids.empty() || (int)nids.size() > MAXT)) { printf("error negative ids\n"); continue; }
       if (ids.empty() || (int)ids.size() > MAXT || H % 16 || W % 16 || (H / 16) * (W / 16) > 6144 || steps < 1 || steps > (full ? 100 : 4) || !(cfg >= 0.f && cfg <= 20.f) || !(shift > 0 && shift <= 20)) { printf("error args\n"); continue; }
-      if (full ? !generate_full(ids, nids, H, W, seed, steps, cfg, shift, outz) : !generate(ids, H, W, seed, steps, outz)) printf("error gen\n");
+      if (full ? !generate_full(ids, nids, H, W, seed, steps, cfg, shift, sampler == "reference", outz) : !generate(ids, H, W, seed, steps, outz)) printf("error gen\n");
     }
   }
   mega_close(g_h);

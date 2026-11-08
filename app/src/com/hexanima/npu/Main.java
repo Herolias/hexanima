@@ -268,7 +268,7 @@ public class Main extends Base {
         sr.addView(dice, dl);
         root.addView(sr);
 
-        // MOSS-Image sampler: Fast = the rapid-moss 4-step adapter (distilled: no CFG, no negative prompt); Full = the model itself with the official sampler (steps, CFG, negative prompt)
+        // MOSS-Image sampler: Fast = the rapid-moss 4-step adapter (distilled: no CFG, no negative prompt); Full = the model itself with CFG (steps, CFG, negative prompt; sampled like Unsloth Studio)
         mossBox = new LinearLayout(this); mossBox.setOrientation(LinearLayout.VERTICAL);
         mossBox.addView(label(L.s("РЕЖИМ", "MODE")));
         LinearLayout mr = new LinearLayout(this);
@@ -469,8 +469,8 @@ public class Main extends Base {
         modeFast.setBackground(bg(on ? CARD : ACC, 14)); modeFast.setTextColor(on ? TXT : ON_ACC);
         modeFull.setBackground(bg(on ? ACC : CARD, 14)); modeFull.setTextColor(on ? ON_ACC : TXT);
         fullBox.setVisibility(on ? View.VISIBLE : View.GONE);
-        modeInfo.setText(on ? L.s("Сама модель с официальным сэмплером (Euler, CFG): лучше анатомия и следование описанию, но каждый шаг с CFG > 1 считает модель дважды. Официально: 50 шагов, CFG 3.",
-                "The model itself with the official sampler (Euler, CFG): better anatomy and prompt following, but every step with CFG above 1 runs the model twice. Official settings: 50 steps, CFG 3.")
+        modeInfo.setText(on ? L.s("Сама модель с CFG (Euler, как в Unsloth Studio): лучше анатомия и следование описанию, но каждый шаг с CFG > 1 считает модель дважды. Обычно 20 шагов, CFG 3.",
+                "The model itself with CFG (Euler, sampled like Unsloth Studio): better anatomy and prompt following, but every step with CFG above 1 runs the model twice. Typical: 20 steps, CFG 3.")
             : L.s("Турбо-адаптер rapid-moss: 4 шага, без CFG и негативного описания (дистиллированная модель).", "The rapid-moss turbo adapter: 4 steps, no CFG or negative prompt (a distilled model)."));
         showFullValues();
     }
@@ -935,7 +935,7 @@ public class Main extends Base {
                     String[] a = s.trim().split("\\s+"); int te = Integer.parseInt(a[0]), rf = Integer.parseInt(a[1]), st = Integer.parseInt(a[2]), dn = Integer.parseInt(a[3]);
                     final int all = a.length > 4 ? Integer.parseInt(a[4]) : steps;   // full mode: the schedule mossrun settled on
                     if (dn > 0) setProgressUi(94, L.s("Декодирование…", "Decoding…"), t0);
-                    else if (rf > 0) setProgressUi(22 + 70 * st / all, L.f("Шаг %d/%d", "Step %d/%d", Math.min(st + 1, all), all), t0);
+                    else if (rf > 0 || st > 0 || a.length > 4) setProgressUi(22 + 70 * st / all, L.f("Шаг %d/%d", "Step %d/%d", Math.min(st + 1, all), all), t0);   // a cached prompt skips the refiner line
                     else if (te > 0) setProgressUi(20, L.s("Подготовка текста…", "Preparing the text…"), t0);
                     else setProgressUi(8, L.s("Кодирование текста на NPU…", "Encoding the text on the NPU…"), t0);
                 } catch (Exception ignored) { }
