@@ -5,6 +5,27 @@
 #include "pool.h"
 #include "kern.h"
 #define KCH 32
+#include "qurt.h"
+
+void hmx_store_v69(uint8_t *, uint32_t);
+void hmx_store_v73(uint8_t *, uint32_t, const uint8_t *);
+static uint8_t *g_hmx_scales; static int g_hmx_cvt = -1;
+int hmx_cvt(void) {   /* 1 = v73+ DSP (QuRT arch version low byte 0x73, 0x75, 0x79, 0x81...) */
+#if __HEXAGON_ARCH__ >= 73
+  g_hmx_cvt = 1;
+#else
+  if (g_hmx_cvt < 0) { qurt_arch_version_t v; g_hmx_cvt = !qurt_sysenv_get_arch_version(&v) && (v.arch_version & 0xff) >= 0x73; }
+#endif
+  return g_hmx_cvt;
+}
+void hmx_scales_init(uint8_t *p) { HVX_Vector *v = (HVX_Vector *)p; v[0] = Q6_V_vsplat_R(0x3c00); v[1] = Q6_V_vzero(); g_hmx_scales = p; hmx_cvt(); }
+void hmx_store(uint8_t *out, uint32_t ctrl) {
+#if __HEXAGON_ARCH__ >= 73
+  hmx_store_v73(out, ctrl, g_hmx_scales);
+#else
+  if (g_hmx_cvt > 0) hmx_store_v73(out, ctrl, g_hmx_scales); else hmx_store_v69(out, ctrl);
+#endif
+}
 
 static void vcopy_range(uint8_t *dst, const uint8_t *src, size_t bytes) {  /* 128B aligned, bytes multiple of 128 */
   HVX_Vector *d = (HVX_Vector *)dst; const HVX_Vector *s = (const HVX_Vector *)src; size_t n = bytes / 128;

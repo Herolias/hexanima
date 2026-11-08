@@ -62,7 +62,10 @@ public class ModelsActivity extends Base {
         String soc = Compat.soc();
         boolean ok = Compat.chipOk();
         info.setText((ok ? L.f("Чип %s · подходит (%s)", "Chip %s · supported (%s)", soc, Compat.archLabel()) : L.f("Чип %s · проверено только на Snapdragon 8 Gen 1 / 8+ Gen 1", "Chip %s · tested only on Snapdragon 8 Gen 1 / 8+ Gen 1", soc))
-            + (ok && !Compat.qnnCommon() ? "\n" + L.s("Текстовый энкодер и декодер работают на CPU, DiT — на NPU", "Text encoder and decoder run on the CPU, the DiT on the NPU") : "")
+            + (ok && !Compat.qnnCommon() ? "\n" + (Compat.npuTe(this) && Compat.npuVae(this) ? L.s("Всё на NPU: текстовый энкодер, DiT и декодер", "Everything on the NPU: text encoder, DiT and decoder")
+                : Compat.npuTe(this) ? L.s("Декодер работает на CPU, остальное — на NPU", "The decoder runs on the CPU, the rest on the NPU")
+                : Compat.npuVae(this) ? L.s("Текстовый энкодер работает на CPU, остальное — на NPU", "The text encoder runs on the CPU, the rest on the NPU")
+                : L.s("Текстовый энкодер и декодер работают на CPU, DiT — на NPU", "Text encoder and decoder run on the CPU, the DiT on the NPU")) : "")
             + "\n" + L.f("Свободно %.1f ГБ", "Free %.1f GB", getFilesDir().getUsableSpace() / 1e9));
         if (downloading) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         load();
@@ -78,7 +81,7 @@ public class ModelsActivity extends Base {
         final String base = url.getText().toString().trim().replaceAll("/*$", "") + "/";
         getSharedPreferences("anima", 0).edit().putString("base", base).apply();
         io.submit(() -> {
-            try { final List<Models.Item> cat = store.catalog(base); if (Compat.chipOk() && !Compat.mossOk()) cat.removeIf(it -> it.moss); /* MOSS-Image decodes through a QNN context that exists for V69 only */ for (Models.Item it : cat) store.refreshMeta(it); ui.post(() -> { items = cat; render(); }); }
+            try { final List<Models.Item> cat = store.catalog(base); if (Compat.chipOk() && !Compat.mossOk()) cat.removeIf(it -> it.moss); /* MOSS-Image decodes through QNN contexts that exist for V69 and V81 only */ for (Models.Item it : cat) store.refreshMeta(it); ui.post(() -> { items = cat; render(); }); }
             catch (Exception e) { ui.post(() -> { list.removeAllViews(); list.addView(text(L.f("Каталог недоступен: %s", "Catalog unavailable: %s", e.getMessage()), 13, BAD, false)); }); }
         });
     }

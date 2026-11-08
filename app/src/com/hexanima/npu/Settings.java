@@ -24,10 +24,10 @@ public class Settings extends Base {
     /** sizes above 4096 patches on chips where they are not verified (V79 upstream gave noise above ~4800) */
     static boolean largeSizes(Context c) { return prefs(c).getBoolean("large", false); }
     static final int[] THREADS = {4, 6, 8};
-    /** CPU threads of sd.cpp (text encoder and decoder run on the CPU on V81; 8 Elite Gen 5 has 2 prime + 6 performance cores) */
+    /** CPU threads of sd.cpp (the text encoder and decoder run on the CPU on V81 without their NPU contexts; 8 Elite Gen 5 has 2 prime + 6 performance cores) */
     static int threads(Context c) { return prefs(c).getInt("threads", Compat.qnnCommon() ? 4 : 6); }
-    static final int[] WORKERS = {0, 4, 5};
-    /** DSP worker threads per block (0 = the default 3, the V69 maximum: V69 has 4 HVX contexts, the main thread needs one) */
+    static final int[] WORKERS = {0, 4, 5, 6};
+    /** DSP worker threads per block (0 = the chip default, Compat.mossWorkers / skel 3: V69 has 4 HVX contexts and the main thread needs one; V81 runs MOSS with 6) */
     static int dspWorkers(Context c) { return prefs(c).getInt("dspw", 0); }
     /** what goes before the prompt: trimmed, ending with a comma and a space; a single space when the user cleared it (anima.sh treats an empty PREFIX as "use the default") */
     static String prefix(Context c) { String p = rawPrefix(c).trim(); return p.isEmpty() ? " " : (p.endsWith(",") ? p : p + ",") + " "; }
@@ -68,7 +68,7 @@ public class Settings extends Base {
             String[] tn2 = new String[THREADS.length]; for (int i = 0; i < THREADS.length; i++) tn2[i] = String.valueOf(THREADS[i]);
             int ti2 = Math.max(0, java.util.Arrays.binarySearch(THREADS, threads(this)));
             cq.addView(choice(L.s("Потоки CPU", "CPU threads"), tn2[ti2], v -> builder().setTitle(L.s("Потоки CPU (текст и декодер)", "CPU threads (text encoder and decoder)")).setSingleChoiceItems(tn2, ti2, (d, i) -> { d.dismiss(); p.edit().putInt("threads", THREADS[i]).apply(); recreate(); }).show()));
-            String[] wn = {L.s("3 (по умолчанию)", "3 (default)"), "4", "5"};
+            String[] wn = {L.s("по умолчанию", "default"), "4", "5", "6"};
             int wi = Math.max(0, java.util.Arrays.binarySearch(WORKERS, dspWorkers(this)));
             cq.addView(choice(L.s("Потоки NPU (эксперимент)", "NPU threads (experimental)"), wn[wi], v -> builder().setTitle(L.s("Потоки NPU на блок", "NPU worker threads per block")).setSingleChoiceItems(wn, wi, (d, i) -> { d.dismiss(); p.edit().putInt("dspw", WORKERS[i]).apply(); recreate(); }).show()));
         }

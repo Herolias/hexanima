@@ -11,6 +11,10 @@
 #include "remote.h"
 #include "mega.h"
 #include "qhblas_hmx.h"
+#include "gemm2.h"
+#include "qurt.h"
+#include <hexagon_types.h>
+#include <hexagon_protos.h>
 
 void hmx8_tile(uint8_t*,uint32_t,uint8_t*,uint32_t,uint8_t*,uint32_t);
 int mega_open(const char *uri, remote_handle64 *h) { *h = (remote_handle64)malloc(1); return *h ? 0 : -1; }
@@ -41,6 +45,7 @@ int mega_probe(remote_handle64 h, int K, int reps, int stage, int64_t *cyc, floa
   uint8_t *vA = vt, *vB = vt + up(M * K * 2), *vO = vB + up(K * N * 2 + M * N * 2 + 4096);
   qhblas_hmx_transfer_row_ahf(A, vA, K);
   qhblas_hmx_transfer_column_ahf(B, vB, K, N);
+  { HVX_Vector *pv = (HVX_Vector *)(vB + (K * 64 + M * 64) * 2); pv[0] = Q6_V_vsplat_R(0x3c00); pv[1] = Q6_V_vzero(); }   /* v73+ output scale/bias block (see gemm2.h); unused by the v69 store */
   if (stage == 0) { *vtcmrc = 11; goto done; }
   HAP_power_request_t rq; memset(&rq, 0, sizeof rq);
   rq.type = HAP_power_set_HMX; rq.hmx.power_up = TRUE;
@@ -55,7 +60,16 @@ int mega_probe(remote_handle64 h, int K, int reps, int stage, int64_t *cyc, floa
     *cyc = HAP_perf_get_pcycles() - t0; *maxerr = 0;
     HAP_compute_res_hmx_unlock(ctx); goto done;
   }
-  if (rc == 0) {
+  if (rc == 0 && hmx_cvt()) {   /* v73+ DSP in a v69 build: the SDK routine was compiled with the legacy store, so the GEMM is done tile by tile with hmx_acc + the v73 store */
+    hmx_scales_init(vB + (K * 64 + M * 64) * 2);
+    uint32_t nb = K >> 5;
+    for (int n = 0; n < N / 32; n++) { hmx_acc(vA, (nb << 11) | 0x7C, vB + (size_t)n * (nb << 11), (nb << 11) - 1); hmx_store(vO + (size_t)n * 2048, 0); }
+    for (int i = 0; i < 32; i += 2) for (int n = 0; n < N / 32; n++) for (int j = 0; j < 32; j++) {   /* crouton -> row-major (rows i, i+1 interleaved) */
+      const __fp16 *t = (const __fp16 *)(vO + (size_t)n * 2048); C[i * N + n * 32 + j] = t[32 * i + 2 * j]; C[(i + 1) * N + n * 32 + j] = t[32 * i + 2 * j + 1]; }
+    float me = 0; for (int i = 0; i < M * N; i++) { float e = fabsf((float)C[i] - R[i]); if (!(e <= me)) me = e; }
+    *maxerr = me; *cyc = 0;
+    HAP_compute_res_hmx_unlock(ctx);
+  } else if (rc == 0) {
     qhblas_hmx_matrix_matrix_mpy_ahf(vA, vB, vO, C, M, K, N);
     float me = 0; for (int i = 0; i < M * N; i++) { float e = fabsf((float)C[i] - R[i]); if (e > me) me = e; }
     *maxerr = me;
@@ -68,6 +82,19 @@ int mega_probe(remote_handle64 h, int K, int reps, int stage, int64_t *cyc, floa
 done:
   HAP_compute_res_release(ctx);
   free(A); free(B); free(C); free(R);
+  return 0;
+}
+
+/* diagnostics for tuning: QuRT arch version, hardware threads, HVX unit mask, VTCM size, compute-resource preemption caps, HMX store in use */
+int mega_info(remote_handle64 h, int *arch, int *hwthreads, int *hvx, int *vtcm_total, int *vtcm_avail, int *caps, int *hmxcvt) {
+  qurt_arch_version_t v; *arch = qurt_sysenv_get_arch_version(&v) ? -1 : (int)v.arch_version;
+  qurt_sysenv_max_hthreads_t t; *hwthreads = qurt_sysenv_get_max_hw_threads(&t) ? -1 : (int)t.max_hthreads;
+  *hvx = qurt_hvx_get_units();
+  unsigned int tot = 0, av = 0; compute_res_vtcm_page_t tl, al;
+  if (HAP_compute_res_query_VTCM(0, &tot, &tl, &av, &al)) tot = av = 0;
+  *vtcm_total = (int)tot; *vtcm_avail = (int)av;
+  unsigned int c = 0; *caps = HAP_compute_res_query_capability(HAP_COMPUTE_RES_PREEMPTION_CAPABILITY, &c) ? -1 : (int)c;
+  *hmxcvt = hmx_cvt();
   return 0;
 }
 

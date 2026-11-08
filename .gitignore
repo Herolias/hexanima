@@ -21,3 +21,5 @@ work/
 __pycache__/
 app/assets/anima.sh
 build_fork/
+hexagon/mega/out_v*/
+moss/hexagon/mega/out_v*/

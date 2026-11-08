@@ -105,6 +105,7 @@ static int vtcm_get(void) {
   g_vt = (uint8_t *)HAP_compute_res_attr_get_vtcm_ptr(&attr);
   g_et = (u16 *)(g_vt + VT_TAB); g_tabs = g_et + 32768; g_tabs2 = g_tabs + 3 * 32768; g_scr = (HVX_Vector *)(g_vt + VT_TAB + 393216);
   memcpy(g_et, g_et_h, 65536); memcpy(g_tabs, g_tabs_h, 3 * 65536); memcpy(g_tabs2, g_tabs2_h, 2 * 65536);
+  hmx_scales_init(g_vt + (8u << 20) - 32768);   /* v73+ HMX output scale block: below the self-test tiles (last 16 KB), above the tables and scratch */
   return 0;
 }
 

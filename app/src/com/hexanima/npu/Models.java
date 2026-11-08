@@ -129,6 +129,7 @@ final class Models {
         JSONObject m = new JSONObject(get(murl));
         File dir = modelDir(it.id); dir.mkdirs(); doneMark(dir).delete();
         JSONArray files = m.getJSONArray("files");
+        if (it.moss) { JSONArray keep = new JSONArray(); for (int i = 0; i < files.length(); i++) if (!Moss.skipFile(files.getJSONObject(i).getString("path"))) keep.put(files.getJSONObject(i)); files = keep; }
         long[] done = {0};
         fetchAll(murl.substring(0, murl.lastIndexOf('/') + 1), files, dir, total(files), done, pg, cancel);
         if (it.moss) {   // MOSS-Image: raw files only, no sd.cpp stub

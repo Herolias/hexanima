@@ -2,7 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "pool.h"
-#define MAXW 5
+#define MAXW 8   /* V69: at most 3 + main (4 HVX contexts); V81 has 12 hardware threads */
 static struct { volatile int gen, done, quit; pool_fn fn; void *arg; int n; pthread_t th[MAXW]; int idx[MAXW]; } P;
 static void *wk(void *p) {
   int i = *(int *)p, seen = 0;

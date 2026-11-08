@@ -21,6 +21,7 @@ int mega_gtest(remote_handle64 h, int M, int K, int N, int nw, int64_t *us, floa
   HAP_compute_res_attr_set_vtcm_param(&attr, 8u << 20, 1); HAP_compute_res_attr_set_hmx_param(&attr, 1);
   uint32_t ctx = HAP_compute_res_acquire(&attr, 100000); if (!ctx) { *rcout = -1; return 0; }
   uint8_t *vt = (uint8_t *)HAP_compute_res_attr_get_vtcm_ptr(&attr);
+  hmx_scales_init(vt + (8u << 20) - 32768);
   __fp16 *A = (__fp16 *)memalign(128, (size_t)M * K * 2), *W = (__fp16 *)memalign(128, (size_t)K * N * 2), *O = (__fp16 *)memalign(128, (size_t)M * N * 2);
   if (!A || !W || !O) { *rcout = -4; HAP_compute_res_release(ctx); return 0; }
   for (int m = 0; m < M; m++) for (int k = 0; k < K; k++) A[((size_t)(m >> 5) * kb + (k >> 5)) * 1024 + tin(m, k)] = (__fp16)gen(m, k, 7);

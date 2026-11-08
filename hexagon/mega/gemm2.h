@@ -5,6 +5,11 @@
 /* O[M x N] = A[M x K] * W[K x N]; all fp16 crouton. A,O: [row slab][col block]; W: [n block][k block]. A, W, O in DDR. vtcm: >= 6 MB scratch. */
 void hmx_acc(uint8_t *, uint32_t, uint8_t *, uint32_t);
 void hmx_store(uint8_t *, uint32_t);
+/* Hexagon v73+ (V81 = Snapdragon 8 Elite Gen 5): the legacy store "mxmem(..):after.hf = acc" writes nothing (zeros), the accumulator is read
+ * through "cvt.hf = acc" + "mxmem(..) = cvt", which applies a per-column scale/bias block (bias = mxmem2): 256 bytes in VTCM, 32 words with fp16 1.0
+ * in the low half, then 128 bytes of zero bias. A zeroed block means scale 0, i.e. all-zero output. Call after every VTCM acquire (no-op on v69). */
+void hmx_scales_init(uint8_t *vtcm256);
+int hmx_cvt(void);   /* 1 when the v73+ store is in use (decided from the DSP arch at run time in a v69 build) */
 typedef struct {   /* optional epilogue run by the pool workers on the finished output tiles (VTCM) */
   int mode;                      /* 0 none (copy to O), 1 residual: x32 += gate*tile (O unused), 2 GELU in place then copy, 3 copy + rope */
   float *x32; const float *gate; /* mode 1: x32 tiles [slab][64], gate[2048] */

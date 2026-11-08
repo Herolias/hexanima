@@ -15,14 +15,20 @@ A 512x768 picture takes about **7 s** with the 2B models and **12 s** with the 2
 It can also run **MOSS-Image 5B** (OpenMOSS, Apache-2.0), a larger model that you prompt with plain sentences. Its text encoder (Qwen3.5-9B), the transformer and the decoder all run on the NPU:
 about 30 s for 512x768 and about 80 s for 1 Mpx; any size with sides that are multiples of 16 (up to 6144 patches). It is an optional ~14 GB download.
 
-> **This fork** adds experimental support for the **Snapdragon 8 Elite Gen 5** (SM8850, Hexagon V81, e.g. Xiaomi 17 Pro Max), branch `port/v81-sm8850`.
-> The diffusion transformer runs on the NPU with the same HMX kernels as on V69. The text encoder and the decoder run on the CPU through sd.cpp,
-> because Qualcomm's QNN context binaries are compiled per Hexagon generation and none exists for V81.
-> It also adds a startup HMX self-test with automatic restart, and a clean stop (SIGTERM, then SIGKILL) so the matrix unit is never left locked by a killed helper:
-> those were the two failure modes that got 8 Elite (V79) support withdrawn upstream. There are new settings for speed and quality: best quality
-> (every step at full resolution), CPU threads, NPU worker threads, and large sizes. Sizes above 4096 patches stay off until they are verified on the device. MOSS-Image is
-> hidden on V81, because its decoder needs a QNN context. Build: `tools/build_fork.sh` (podman or docker, host Android SDK; no QNN SDK needed, and the
-> unchanged native libraries come from the upstream release APK). **Status: built, not yet verified on a V81 phone.**
+> **This fork** adds support for the **Snapdragon 8 Elite Gen 5** (SM8850, Hexagon V81, e.g. Xiaomi 17 Pro Max), branch `port/v81-sm8850`.
+> - **HMX on V81**: the legacy accumulator store writes zeros on v73+; the DSP skels (Anima and MOSS) now read the accumulator through the v73+ cvt path
+>   (scale/bias block in VTCM), picked at run time, so one v69-compiled skel serves V69 and V81.
+> - **QNN on V81**: text encoder, decoders and MOSS's FLUX.2 decoder are recompiled as V81 context binaries with QAIRT 2.43 (`tools/qnn_ctx.sh`,
+>   `export/build_common_arch.sh`, `moss/build_vaes_v81.sh`; host tools in an Ubuntu 22.04 container, `tools/qairt.Containerfile`). The app ships the 2.43 runtime
+>   as `libQnnHtp243.so` / `libQnnSystem243.so` next to upstream's 2.28 libraries. Without the V81 contexts, Anima's text encoder and decoder fall back to the CPU (sd.cpp).
+> - **Measured on a Xiaomi 17 Pro Max**: Anima 2B 1024x1024 19.5 s (was 37.9 s with the CPU text encoder/decoder), 512x768 warm ~4 s on the NPU side;
+>   MOSS-Image 1024x1024 ~38 s and 832x1216 37.6 s (6 DSP workers and 20 DiT blocks kept in the page cache on 14 GB+ phones; 3 workers: 45 s). Outputs are
+>   bit-identical across worker counts; 8 workers hang the DSP call, so the count is capped at 6.
+> - Startup HMX self-test with automatic restart and a clean stop (SIGTERM, then SIGKILL), new settings (best quality, CPU threads, NPU worker threads, large sizes),
+>   16 KB-aligned APK packaging. Build: `QAIRT=<sdk> DEBUGGABLE=1 tools/build_fork.sh [--install]` (podman or docker, host Android SDK; the unchanged native
+>   libraries come from the upstream release APK). The QAIRT runtime is not redistributable: do not publish APKs built with it.
+> - **Open**: the V81 context binaries are not hosted anywhere yet, so they are copied into the app with `adb` (`files/anima/{te0..te3,vae}.bin, te_embed.f16`,
+>   `files/vae81/vae_WxH.bin`); sizes above 4096 patches are unverified on V81.
 
 ## Features
 

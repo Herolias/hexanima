@@ -133,7 +133,7 @@ int main(int argc, char** argv) {
   remote_handle64 h = 0; int r = mega_open(mega_URI CDSP_DOMAIN, &h);
   if (r) { fprintf(stderr, "mega_open 0x%x\n", r); return 1; }
   if (!getenv("MEGA_NOSELFTEST") && !hmx_selftest(h, first)) { fprintf(stderr, "megarun %d: HMX unavailable\n", first); printf("error hmx\n"); fflush(stdout); mega_close(h); return 3; }
-  const int nw_env = getenv("MEGA_NW") ? atoi(getenv("MEGA_NW")) : 0;   // DSP worker threads per block (skel default 3, its maximum 5); V81 has more HVX contexts than V69
+  const int nw_env = getenv("MEGA_NW") ? atoi(getenv("MEGA_NW")) : 0;   // DSP worker threads per block (skel default 3, at most 6: MOSS hung with 8 on V81); V81 has more HVX contexts than V69
   for (int i = 0; i < count; i++) {   // map once (a DSP process takes at most ~13 of these buffers: run several megarun processes for 28 blocks)
     int fd = rpcmem_to_fd(wts[i]);
     dma_buf_sync_ sy = {(1ull << 2) | 3};   // DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW: clean CPU caches so the DSP sees the weights
@@ -171,7 +171,7 @@ int main(int argc, char** argv) {
       if (fastrpc_mmap(CDSP_DOMAIN_ID, blobfd, blob, 0, Lb.total, FASTRPC_MAP_FD)) { fprintf(stderr, "blob mmap failed\n"); printf("error\n"); fflush(stdout); continue; }
     }
     Layout L = layout(T);
-    if (nw_env > 0 && nw_env <= 5) L.meta[M_NW] = nw_env;
+    if (nw_env > 0 && nw_env <= 6) L.meta[M_NW] = nw_env;
     if (gh != cur_gh || gw != cur_gw) { make_rope(gh, gw, (f32*)(blob + L.meta[M_COS]), (f32*)(blob + L.meta[M_SIN])); cur_gh = gh; cur_gw = gw; }
     to_ctx16((const f32*)cb.data(), (__fp16*)(blob + L.meta[M_CTX]));
     bool xin32 = xi.size() > 4 && xi.compare(xi.size() - 4, 4, ".x32") == 0;

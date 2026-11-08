@@ -263,6 +263,9 @@ static Chain spawn(const std::string& ph, int first, int count, const std::strin
     return {fdopen(pin[1], "w"), fdopen(pout[0], "r"), pid};
 }
 // helper executables: ./name in the work dir (root setup) or $ANIMAD_BIN/libname.so (the app ships them as native libs, the only place an app may exec from)
+/* QNN runtime the decoder / text encoder helpers load (ANIMAD_QNN_HTP / ANIMAD_QNN_SYS: Hexagon V81 needs QAIRT 2.43, shipped as libQnnHtp243.so / libQnnSystem243.so) */
+static const char* qnn_htp() { const char* e = getenv("ANIMAD_QNN_HTP"); return e && *e ? e : "libQnnHtp.so"; }
+static const char* qnn_sys() { const char* e = getenv("ANIMAD_QNN_SYS"); return e && *e ? e : "libQnnSystem.so"; }
 static std::string binpath(const char* n) { const char* d = getenv("ANIMAD_BIN"); return d ? std::string(d) + "/lib" + n + ".so" : std::string("./") + n; }
 static Chain spawn_mega(const std::string& ph, int first, int count, const std::string& hd = "hmx") {   // HMX block runner (hexagon/mega): all 28 blocks in one process, fp16 weights from ph/hmx
     int pin[2], pout[2];
@@ -289,7 +292,7 @@ static Chain spawn_vae(const std::string& ph) {
         close(pin[1]); close(pout[0]);
         if (chdir(ph.c_str())) _exit(127);
         if (!getenv("ANIMAD_BIN")) { setenv("LD_LIBRARY_PATH", ".", 1); setenv("ADSP_LIBRARY_PATH", ".", 1); }   /* app: inherited, they point at the native lib dir */
-        execl(binpath("vaerun").c_str(), "vaerun", "libQnnHtp.so", "libQnnSystem.so", "vae.bin", (char*)nullptr);
+        execl(binpath("vaerun").c_str(), "vaerun", qnn_htp(), qnn_sys(), "vae.bin", (char*)nullptr);
         _exit(127);
     }
     close(pin[0]); close(pout[1]);
@@ -304,7 +307,7 @@ static Chain spawn_te(const std::string& ph) {
         close(pin[1]); close(pout[0]);
         if (chdir(ph.c_str())) _exit(127);
         if (!getenv("ANIMAD_BIN")) { setenv("LD_LIBRARY_PATH", ".", 1); setenv("ADSP_LIBRARY_PATH", ".", 1); }   /* app: inherited, they point at the native lib dir */
-        execl(binpath("terun").c_str(), "terun", "libQnnHtp.so", "libQnnSystem.so", "te0.bin", "te1.bin", "te2.bin", "te3.bin", (char*)nullptr);
+        execl(binpath("terun").c_str(), "terun", qnn_htp(), qnn_sys(), "te0.bin", "te1.bin", "te2.bin", "te3.bin", (char*)nullptr);
         _exit(127);
     }
     close(pin[0]); close(pout[1]);

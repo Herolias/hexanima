@@ -101,6 +101,7 @@ static int vtcm_get(void) {
   g_ctx = HAP_compute_res_acquire(&attr, 5000000); if (!g_ctx) return -1;
   g_vt = (uint8_t *)HAP_compute_res_attr_get_vtcm_ptr(&attr);
   g_et = (u16 *)(g_vt + VT_TAB); g_t2 = g_et + 32768; g_scr = (HVX_Vector *)(g_vt + VT_TAB + 262144);
+  hmx_scales_init(g_vt + VT_TAB + 131072);   /* v73+ HMX output scale block, in the free gap between the tables (128 KB) and the scratch (256 KB) */
   memcpy(g_et, g_et_h, 65536); memcpy(g_t2, g_t2_h, 65536);
   return 0;
 }

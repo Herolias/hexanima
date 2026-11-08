@@ -608,7 +608,7 @@ public class Main extends Base {
     /** rough time to a picture: the catalog speed at 512x768 scaled by the patch count, times the number of pictures */
     String genLabel() {
         if (model.isEmpty()) return L.s("Скачать модель", "Get a model");
-        long est = Math.max(3, Math.round(store.speed(model) * ((resW / 16) * (resH / 16)) / 1536.0)) * count;
+        long est = Math.max(3, Moss.is(model) ? Moss.estimate(store.speed(model), resW, resH) : Math.round(store.speed(model) * ((resW / 16) * (resH / 16)) / 1536.0)) * count;
         return count > 1 ? L.f("Генерировать ×%d  ·  ~%d с", "Generate ×%d  ·  ~%d s", count, est) : L.f("Генерировать  ·  ~%d с", "Generate  ·  ~%d s", est);
     }
 
@@ -837,6 +837,8 @@ public class Main extends Base {
     File runOneMoss(String pr, String seedS, int w, int h, long t0) {
         final File home = getFilesDir(), M = Moss.dir(home), ids = new File(M, "ids.i32"), raw = new File(M, "img.f32");
         setProgressUi(3, L.s("Токенизация…", "Tokenising…"), t0);
+        final String ve = Moss.vaeError(home);
+        if (ve != null) { ui.post(() -> Toast.makeText(this, ve, Toast.LENGTH_LONG).show()); return null; }
         try { Moss.writeIds(home, pr, ids); } catch (Exception e) { ui.post(() -> Toast.makeText(this, "tokenizer: " + e, Toast.LENGTH_LONG).show()); return null; }
         String loraEnv = ""; final boolean useLora = loraOn(); final float lstr = strBar.getProgress() * 0.05f;
         if (useLora) {
@@ -860,7 +862,7 @@ public class Main extends Base {
             }
         });
         poll.start();
-        su("rm -f " + q(raw.getPath()) + "; " + loraEnv + "M=" + q(M.getPath()) + " sh " + D + "/moss.sh " + q(ids.getPath()) + " " + w + " " + h + " " + seedS + " " + STEPS + " " + q(raw.getPath()) + " < /dev/null >> " + D + "/gen.log 2>&1", false);
+        su("rm -f " + q(raw.getPath()) + "; " + loraEnv + Moss.env(this) + "M=" + q(M.getPath()) + " sh " + D + "/moss.sh " + q(ids.getPath()) + " " + w + " " + h + " " + seedS + " " + STEPS + " " + q(raw.getPath()) + " < /dev/null >> " + D + "/gen.log 2>&1", false);
         done[0] = true;
         try { poll.join(); } catch (InterruptedException ignored) { }
         if (cancelled) return null;

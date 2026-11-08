@@ -8,4 +8,5 @@ interface mega : remote_handle64 {
   long ktest(in long which, rout float err, rout long long us, rout long long cyc);
   long gtest(in long M, in long K, in long N, in long nw, rout long long us, rout float err, rout long rc);
   long block(in sequence<long> meta, in long wfd, in long bfd, in sequence<uint8> mod, rout sequence<long> times, rout long rc);
+  long info(rout long arch, rout long hwthreads, rout long hvx, rout long vtcm_total, rout long vtcm_avail, rout long caps, rout long hmxcvt);   /* appended: older stubs keep their method indices */
 };

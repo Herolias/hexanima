@@ -81,6 +81,7 @@ static size_t read_into(const std::string& path, uint8_t* dst, size_t maxb, bool
 // stream a list of pack files through the two g_te buffers: a loader thread reads file i+1 while use(i) runs on the DSP
 #include <functional>
 static int g_keep_blocks = 0;
+static int g_nw = 3;   // DSP worker threads per call (MOSS_NW, 1..6): 3 suits V69; on V81 6 is ~13% faster with identical output, 8 hangs the DSP call
 static std::string g_ovl;   // MOSS_LORA=dir: user-LoRA patches (blkNN.ovl) laid over the DiT packs' rank-128 LoRA slots after each read
 static void apply_ovl(const std::string& pack, uint8_t* dst, size_t maxb) {
   if (g_ovl.empty() || pack.find("/dit/") == std::string::npos) return;
@@ -221,7 +222,7 @@ static bool encode_text(const std::vector<int>& ids, std::vector<f32>& tx) {
   memset(blob + L.meta[M_H], 0, (size_t)ntokT * 4096 * 2);
   sync_clean(g_blobTE);
   int meta[M_NMETA]; memset(meta, 0, sizeof meta); for (int i = 0; i < M_NMETA; i++) meta[i] = L.meta[i];
-  meta[M_NTOK] = ntokT; meta[M_NVALID] = T; meta[M_NW] = 3; meta[M_NCB] = 128;
+  meta[M_NTOK] = ntokT; meta[M_NVALID] = T; meta[M_NW] = g_nw; meta[M_NCB] = 128;
   std::vector<std::string> tef; for (int i = 0; i <= NLAYER_TE; i++) { char p[512]; snprintf(p, sizeof p, "%s/te/te%02d.bin", g_dir.c_str(), i); tef.push_back(p); }
   bool ok = stream_files(tef, g_te, [&](int i, Buf& b) {
     meta[M_MODE] = i == NLAYER_TE ? 30 : (i % 4 == 3 ? 21 : 20); meta[M_FIRST] = i == 0; meta[M_REL] = i == NLAYER_TE;
@@ -235,7 +236,7 @@ static bool encode_text(const std::vector<int>& ids, std::vector<f32>& tx) {
   fill_consts(blob, L, ns);
   std::vector<f32> rmod(18432, 0.f); for (int i = 0; i < 3072; i++) { rmod[2 * 3072 + i] = 1.f; rmod[5 * 3072 + i] = 1.f; }
   sync_clean(g_blobTE);
-  meta[M_NCB] = 96; meta[M_NW] = 3;
+  meta[M_NCB] = 96; meta[M_NW] = g_nw;
   { std::vector<std::string> rf; for (const char* n : {"proj", "ref0", "ref1"}) rf.push_back(g_dir + "/ref/" + n + ".bin");
     ok = stream_files(rf, g_te, [&](int i, Buf& b) { meta[M_MODE] = i == 0 ? 2 : 1; meta[M_FIRST] = i == 0; meta[M_REL] = i == 2; return call(L, meta, b, 0, g_blobTE, rmod.data(), 18432) == 0; }); }
   if (!ok) return false;
@@ -303,7 +304,7 @@ static bool generate(const std::vector<int>& ids, int Hpx, int Wpx, unsigned see
   const f32* Wfin = g_glue.f("final_linear_video.weight"); const f32* nfin = g_glue.f("final_norm_video.weight");
   std::vector<f32> rows((size_t)N * 3072), mod, head, outrows((size_t)Nimg * 3072);
   int meta[M_NMETA]; for (int i = 0; i < M_NMETA; i++) meta[i] = L.meta[i];
-  meta[M_NW] = 3; meta[M_NCB] = 96; meta[M_MODE] = 0;
+  meta[M_NW] = g_nw; meta[M_NCB] = 96; meta[M_MODE] = 0;
   for (int s = 0; s < steps; s++) {
     double ts = now(), tA = ts, tB, tC, tD, tE;
     const bool lowstep = low && s < LR;
@@ -363,6 +364,7 @@ int main(int argc, char** argv) {
       g_LT = make_layout(MAXT, 4096, 12288, true); g_blobTE = make_buf(g_LT.total, true); if (!g_blobTE.p) { printf("error teblob\n"); continue; } memset(g_blobTE.p, 0, g_LT.total);
       { long long avail = 0; FILE* mi = fopen("/proc/meminfo", "r"); char ln[256]; while (mi && fgets(ln, sizeof ln, mi)) if (!strncmp(ln, "MemAvailable:", 13)) avail = atoll(ln + 13) * 1024; if (mi) fclose(mi);
         if (getenv("MOSS_LORA")) g_ovl = getenv("MOSS_LORA");
+        if (getenv("MOSS_NW")) { int n = atoi(getenv("MOSS_NW")); if (n >= 1 && n <= 6) g_nw = n; }
         g_keep_blocks = getenv("MOSS_KEEP") ? atoi(getenv("MOSS_KEEP")) : 0;   // measured: keeping blocks in the page cache made steps slower on a 12 GB phone (reclaim stalls), so it is opt-in
         fprintf(stderr, "page cache keeps the first %d DiT blocks (MemAvailable %.1f GB)\n", g_keep_blocks, avail / 1e9); }
       printf("loaded %.1f\n", now() - t0); continue;

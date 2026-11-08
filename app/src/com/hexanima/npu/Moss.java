@@ -11,6 +11,26 @@ final class Moss {
     static boolean is(String id) { return id != null && id.startsWith(PREFIX_ID); }
     static File dir(File home) { return new File(home, "moss"); }
     static boolean installed(File home) { return new File(dir(home), ".installed").exists(); }
+    /** decoder contexts: the pack's vae/ (V69), or files/vae81 on V81 (kept outside the model dir, so reinstalling the model keeps them) */
+    static File vaeDir(File home) { return Compat.qnn243() ? new File(home, "vae81") : new File(dir(home), "vae"); }
+    /** the pack's vae/ holds V69 contexts only: not downloaded on other generations */
+    static boolean skipFile(String path) { return Compat.qnn243() && path.startsWith("vae/"); }
+    /** a decoder exists for any size (512x512 is the tiled fallback); null = fine */
+    static String vaeError(File home) {
+        return new File(vaeDir(home), "vae_512x512.bin").exists() ? null
+            : L.f("Нет декодера для этого чипа (%s/vae_512x512.bin)", "No decoder for this chip yet (%s/vae_512x512.bin)", vaeDir(home).getPath());
+    }
+    /** environment for moss.sh: decoder dir, the QNN runtime of this generation, DSP workers and page-cache blocks for mossrun */
+    static String env(android.content.Context c) {
+        File home = c.getFilesDir(); int nw = Compat.mossWorkers(c), keep = Compat.mossKeep(c);
+        return "VAED='" + vaeDir(home).getPath() + "' " + (Compat.qnn243() ? "QH=libQnnHtp243.so QS=libQnnSystem243.so " : "")
+            + (nw > 0 ? "MOSS_NW=" + nw + " " : "") + (keep > 0 ? "MOSS_KEEP=" + keep + " " : "");
+    }
+    /** rough seconds per picture: V81 measured ~38 s at 1024x1024 (4 steps, 6 workers) plus a few seconds of text encoder / decoder; elsewhere the catalog speed (512x768) scaled by patches */
+    static long estimate(int speed512x768, int w, int h) {
+        double p = (w / 16) * (h / 16);
+        return Math.round(Compat.qnn243() ? 4 + 34.0 * p / 4096 : speed512x768 * p / 1536.0);
+    }
 
     /** size presets (W×H): around 1 Mpx is what the 4-step adapter was trained on (1024², 896×1152, 832×1216, 768×1344 and their landscape twins); smaller ones are faster */
     static final int[][] PRESETS = {{512, 512}, {640, 640}, {768, 768}, {1024, 1024}, {512, 768}, {768, 512}, {576, 1024}, {1024, 576}, {640, 1152}, {1152, 640}, {768, 1024}, {1024, 768},

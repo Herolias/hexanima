@@ -40,7 +40,9 @@ if __name__ == "__main__":
     from taehv_torch import decode
     torch.set_grad_enabled(False)
     m = Dec().eval()
-    z = torch.from_numpy(np.fromfile("z.bin", np.float32)).reshape(1, 16, 96, 64)
+    import os   # check latent: z.bin from sd.cpp if present, else a seeded normal one; both are saved next to the ONNX (OUT.z.bin, OUT.ref.bin) to check a compiled context
+    z = torch.from_numpy(np.fromfile("z.bin", np.float32)).reshape(1, 16, 96, 64) if os.path.exists("z.bin") else torch.randn(1, 16, 96, 64, generator=torch.Generator().manual_seed(1))
     ref = decode(load(), z); out = m(z)
     print("static vs generic rel err", ((out - ref).norm() / ref.norm()).item())
+    z.numpy().astype(np.float32).tofile(sys.argv[1] + ".z.bin"); ref.numpy().astype(np.float32).tofile(sys.argv[1] + ".ref.bin")
     torch.onnx.export(m, z, sys.argv[1], input_names=["z"], output_names=["img"], opset_version=13)
