@@ -33,8 +33,8 @@ final class Moss {
         return Math.round(Compat.qnn243() ? (full ? 6 : 4) + 8.5 * passes * p / 4096 : speed512x768 * p / 1536.0 * passes / 4);
     }
 
-    /** full model (rapid-moss adapter off) sampled like Unsloth Studio does MOSS-Image-SFT: FlowMatch Euler on ComfyUI's sgm_uniform shift-5 schedule, plain CFG with
-     *  a negative prompt (the reference pipeline's block-22 skip in the negative branch makes SFT pictures smooth and airbrushed) */
+    /** full model (rapid-moss adapter off) sampled like Unsloth Studio renders MOSS-Image-SFT GGUFs (stable-diffusion.cpp defaults): Euler on the discrete shift-5
+     *  schedule, plain CFG with a negative prompt, sd.cpp's Philox noise for the seed (the reference pipeline's block-22 skip makes SFT pictures airbrushed) */
     static final int FULL_STEPS_MIN = 8, FULL_STEPS_MAX = 60, FULL_STEPS_DEF = 20;
     static final float CFG_DEF = 3f;
     /** the SFT model's own time embedding (glue.bin carries the adapter's): files/moss/glue_base.bin from moss/export_glue_base.py; null = fine */

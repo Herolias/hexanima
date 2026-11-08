@@ -1,8 +1,10 @@
 """MOSS-Image full model on a desktop GPU (bf16 weights, like the desktop pipelines): sampler-settings study against the phone.
 usage: python sampler_gpu.py OUTDIR TX TXN W H SEED CFG RUN [RUN ...]      env MOSS_GGUF (default models/MOSS-Image-SFT-Q8_0.gguf), Z (noise file, e.g. a MOSS_DUMP z.bin)
 TX / TXN: refined text rows, mossrun's tx.cache format or a MOSS_DUMP tx.bin / tn.bin.
-RUN = KIND:STEPS[:SHIFT][:sgm][:noskip]   KIND euler | 2m (DPM-Solver++ 2M); sgm = Unsloth Studio's sgm_uniform schedule (default: the reference training-grid
-      schedule); noskip = no block skipped in the negative branch (Studio on SFT; default: block 22 as pipeline_moss_image.py). Studio = euler:20:sgm:noskip.
+RUN = KIND:STEPS[:SHIFT][:disc|:sgm][:noskip]   KIND euler | 2m (DPM-Solver++ 2M); disc = stable-diffusion.cpp's discrete schedule (Unsloth Studio on a GGUF),
+      sgm = ComfyUI sgm_uniform (Studio's diffusers route); default: the reference training-grid schedule; noskip = no block skipped in the negative branch
+      (Studio on SFT; default: block 22 as pipeline_moss_image.py). Studio on a GGUF = euler:20:disc:noskip with RNG=philox.
+env RNG=philox: sd.cpp's default noise for SEED (what mossrun draws); otherwise torch.randn on the CPU, or the file in Z.
 Writes OUTDIR/<run>.lat (final latent [128,H/16,W/16] fp32, before BN denorm, for decode_cmp-style decoding).  Needs a CUDA torch and ~10 GB of VRAM."""
 import os, sys, time, struct, numpy as np, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,15 +47,23 @@ def sigmas(steps, shift):   # MOSSImageScheduler (same as mossrun moss_sigmas)
 def sgm_uniform(steps, shift):   # Unsloth Studio default (ComfyUI sgm_uniform over ModelSamplingDiscreteFlow), terminal zero appended by the loop
     sh = lambda t: shift * t / (1 + (shift - 1) * t); grid = sh(torch.arange(1, 1001, 1) / 1000); ts = torch.linspace(grid[-1], grid[0], steps + 1)[:-1]
     return [float(sh(t)) for t in ts]
+def sdcpp_discrete(steps, shift):   # stable-diffusion.cpp DiscreteScheduler + DiscreteFlowDenoiser: t = 999 - i*999/(n-1), sigma = shift((t+1)/1000), then 0
+    sh = lambda t: np.float32(shift) * t / (np.float32(1) + np.float32(shift - 1) * t); st = np.float32(999) / np.float32(steps - 1)
+    return [float(sh((np.float32(999) - st * np.float32(i) + np.float32(1)) / np.float32(1000))) for i in range(steps)]
 SKIP = {22}
 def vel(x, s):
     t = float(np.float32(s) * np.float32(1000)); vc = forward(x, t, tx)
     if cfg == 1: return vc
     vu = forward(x, t, tn, skip=SKIP); return vu + cfg * (vc - vu)
-noise = (torch.from_numpy(np.fromfile(os.environ["Z"], np.float32).reshape(128, H, Wd)) if os.environ.get("Z") else torch.randn(128, H, Wd, generator=torch.Generator().manual_seed(seed))).to(dev)   # Z: the phone's noise (MOSS_DUMP z.bin)
+if os.environ.get("RNG") == "philox":
+    import importlib.util; spec = importlib.util.spec_from_file_location("cn", os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_noise.py"))
+    src_cn = open(spec.origin).read(); ns = {"np": np}; exec(src_cn[src_cn.index("def sdcpp_philox_randn"):src_cn.index("src = open(")], ns)
+    noise = torch.from_numpy(ns["sdcpp_philox_randn"](seed, 128 * H * Wd).reshape(128, H, Wd)).to(dev)
+else:
+    noise = (torch.from_numpy(np.fromfile(os.environ["Z"], np.float32).reshape(128, H, Wd)) if os.environ.get("Z") else torch.randn(128, H, Wd, generator=torch.Generator().manual_seed(seed))).to(dev)   # Z: the phone's noise (MOSS_DUMP z.bin)
 for run in runs:
     kind, steps, *opt = run.split(":"); shift = next((float(o) for o in opt if o[0].isdigit()), 5.0)
-    sg = (sgm_uniform(int(steps), shift) if "sgm" in opt else sigmas(int(steps), shift)) + [0.0]; SKIP = set() if "noskip" in opt else {22}
+    sg = (sgm_uniform(int(steps), shift) if "sgm" in opt else sdcpp_discrete(int(steps), shift) if "disc" in opt else sigmas(int(steps), shift)) + [0.0]; SKIP = set() if "noskip" in opt else {22}
     x = noise.clone(); prev = None; t0 = time.time()
     for i in range(len(sg) - 1):
         s, sn = sg[i], sg[i + 1]; v = vel(x, s)

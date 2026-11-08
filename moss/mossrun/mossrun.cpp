@@ -4,8 +4,8 @@
 // stdin:  "load MODELDIR"                         read glue + DiT packs (resident), prints "loaded <s>"
 //         "gen IDS.i32 H W SEED STEPS OUT.z"      prints "step i <ms>" lines and "done <ms>"; OUT = fp32 [32][H/8][W/8] (BN-denormalised, unpatchified)
 //         "gen IDS.i32 H W SEED STEPS OUT.z full CFG NEG.i32 [SHIFT [studio|reference]]"   full model: rapid-moss adapter off, FlowMatch Euler, CFG with the
-//                                                 negative prompt NEG. studio (default) = Unsloth Studio's MOSS-Image-SFT settings: ComfyUI's sgm_uniform shift-5
-//                                                 schedule, no block skipped in the negative branch; reference = pipeline_moss_image.py's defaults: shift-5 schedule
+//                                                 negative prompt NEG. studio (default) = Unsloth Studio on a MOSS-Image-SFT GGUF (stable-diffusion.cpp defaults):
+//                                                 discrete shift-5 schedule, no block skipped in the negative branch; reference = pipeline_moss_image.py's defaults: shift-5 schedule
 //                                                 snapped to the training grid, block 22 skipped in the negative branch (on the SFT model that gives a smooth,
 //                                                 airbrushed look). Prints "schedule N" first; needs MODELDIR/glue_base.bin
 //         "quit"
@@ -303,7 +303,25 @@ static void upsample2(const f32* src, int h, int w, f32* dst) {   // [128][h][w]
       const f32* p = src + (size_t)c * h * w; dst[((size_t)c * 2 * h + y) * 2 * w + x] = (1 - ty) * ((1 - tx_) * p[ya * w + xa] + tx_ * p[ya * w + xb]) + ty * ((1 - tx_) * p[yb * w + xa] + tx_ * p[yb * w + xb]); } } });
 }
 
-static bool generate(const std::vector<int>& ids, int Hpx, int Wpx, unsigned seed, int steps, const std::string& outz) {
+// Initial noise exactly as Unsloth Studio draws it for MOSS-Image GGUFs: Studio renders them with stable-diffusion.cpp, whose default RNG ("cuda") is
+// PhiloxRNG (AUTOMATIC1111's port imitating torch.randn on CUDA). Element i of the flat [128][H/16][W/16] latent = Box-Muller (sine branch) of Philox4x32-10
+// on counter (0, 0, i, 0) with key (seed low 32 bits, seed high 32 bits). With the same prompt, settings and seed the phone starts where Studio starts
+// (moss/check_noise.py checks this function against a port of sd.cpp's rng_philox.hpp).
+static void philox_randn(uint64_t seed, f32* out, size_t n) {
+  const uint32_t M0 = 0xD2511F53u, M1 = 0xCD9E8D57u, W0 = 0x9E3779B9u, W1 = 0xBB67AE85u;
+  const float inv = 2.3283064e-10f, inv2pi = 2.3283064e-10f * 6.2831855f;
+  for (size_t i = 0; i < n; i++) {
+    uint32_t c0 = 0, c1 = 0, c2 = (uint32_t)i, c3 = 0, k0 = (uint32_t)seed, k1 = (uint32_t)(seed >> 32);
+    for (int r = 0; r < 10; r++) {   // ten rounds, the key bumped between them
+      const uint64_t v1 = (uint64_t)c0 * M0, v2 = (uint64_t)c2 * M1;
+      c0 = (uint32_t)(v2 >> 32) ^ c1 ^ k0; c1 = (uint32_t)v2; c2 = (uint32_t)(v1 >> 32) ^ c3 ^ k1; c3 = (uint32_t)v1;
+      k0 += W0; k1 += W1;
+    }
+    const float u = (float)c0 * inv + inv / 2, v = (float)c1 * inv2pi + inv2pi / 2;
+    out[i] = sqrtf(-2.f * logf(u)) * sinf(v);
+  }
+}
+static bool generate(const std::vector<int>& ids, int Hpx, int Wpx, uint64_t seed, int steps, const std::string& outz) {
   double tall = now(); std::vector<f32> tx;
   if (load_tx(ids, tx)) fprintf(stderr, "te: cached\n"); else { if (!encode_text(ids, tx)) return false; save_tx(ids, tx); }
   const int T = (int)ids.size(), H = Hpx / 16, W = Wpx / 16, Nimg = H * W, N = Nimg + T, ntok = (N + 31) / 32 * 32;
@@ -317,7 +335,7 @@ static bool generate(const std::vector<int>& ids, int Hpx, int Wpx, unsigned see
   std::vector<f32> bands(16); for (int i = 0; i < 16; i++) bands[i] = g_glue.f("rope.bands")[i];
   int ropeFor = -1;   // 0 = low grid, 1 = full grid
   std::vector<f32> z((size_t)128 * Nimg), x0((size_t)128 * Nimg, 0.f), xin((size_t)128 * Nimg), v((size_t)128 * Nimg), zl, x0l;
-  { std::mt19937 gen(seed); std::normal_distribution<float> nd(0.f, 1.f); for (auto& a : z) a = nd(gen); }
+  philox_randn(seed, z.data(), z.size());
   if (low) { zl.resize((size_t)128 * Nl); x0l.assign((size_t)128 * Nl, 0.f);
     for (int c = 0; c < 128; c++) for (int i = 0; i < Hl; i++) for (int j = 0; j < Wl; j++) { const f32* p = &z[(size_t)c * Nimg]; zl[((size_t)c * Hl + i) * Wl + j] = 0.5f * (p[(2 * i) * W + 2 * j] + p[(2 * i) * W + 2 * j + 1] + p[(2 * i + 1) * W + 2 * j] + p[(2 * i + 1) * W + 2 * j + 1]); } }   // mean of 4 N(0,1) times 2: unit variance
   const f32* Q = g_glue.f("latent_mix.Q"); const f32* codes = g_glue.f("step_codes");
@@ -387,12 +405,13 @@ static std::vector<float> moss_sigmas(int steps, double shift) {   // MOSSImageS
     const float v = fabsf(s - tr[lo]) <= fabsf(tr[up] - s) ? tr[lo] : tr[up]; if (out.empty() || out.back() != v) out.push_back(v); }
   return out;
 }
-static std::vector<float> sgm_sigmas(int steps, double shift) {   // Unsloth Studio's default (diffusion_moss_image.sgm_uniform_sigmas = ComfyUI sgm_uniform over
-  // ModelSamplingDiscreteFlow, multiplier 1): linspace(sigma_max, sigma_min, steps + 1)[:-1] in timestep space, re-shifted; the sampler appends sigma 0
-  const float s = (float)shift, s1 = (float)(shift - 1); auto sh = [&](float t) { return s * t / (1.f + s1 * t); };
-  std::vector<float> ts = lin32(sh(1.f), sh(1.f / 1000.f), steps + 1); ts.pop_back();
-  for (auto& t : ts) t = sh(t);
-  return ts;
+static std::vector<float> sdcpp_sigmas(int steps, double shift) {   // Unsloth Studio on a MOSS GGUF = stable-diffusion.cpp's default: DiscreteScheduler over
+  // DiscreteFlowDenoiser, t = 999 - i * 999 / (steps - 1), sigma = shift((t + 1) / 1000), float32 as sd.cpp; the sampler appends sigma 0
+  const float s = (float)shift; auto sh = [&](float t) { return s == 1.f ? t : s * t / (1.f + (s - 1.f) * t); };
+  std::vector<float> v; if (steps == 1) { v.push_back(sh(1.f)); return v; }
+  const float st = 999.f / (float)(steps - 1);
+  for (int i = 0; i < steps; i++) v.push_back(sh((999.f - st * (float)i + 1.f) / 1000.f));
+  return v;
 }
 static void embed_latent(const f32* lat, int Ni, f32* rows) {   // video_embedder: [128][Ni] -> rows [Ni][3072]
   const f32* Wemb = g_glue.f("video_embedder.weight"); const f32* bemb = g_glue.f("video_embedder.bias");
@@ -410,7 +429,7 @@ static void head_velocity(f32* outrows, int Ni, const std::vector<f32>& head, f3
 static void dump(const char* name, const void* p, size_t bytes) {   // MOSS_DUMP=dir: sampler inputs/outputs for the PC reference (moss/check_full.py)
   const char* d = getenv("MOSS_DUMP"); if (!d) return; FILE* f = fopen((std::string(d) + "/" + name).c_str(), "wb"); if (!f) return; fwrite(p, 1, bytes, f); fclose(f);
 }
-static bool generate_full(const std::vector<int>& ids, const std::vector<int>& nids, int Hpx, int Wpx, unsigned seed, int steps, float cfg, double shift, bool reference, const std::string& outz) {
+static bool generate_full(const std::vector<int>& ids, const std::vector<int>& nids, int Hpx, int Wpx, uint64_t seed, int steps, float cfg, double shift, bool reference, const std::string& outz) {
   if (!g_haveB) { fprintf(stderr, "full mode needs %s/glue_base.bin\n", g_dir.c_str()); return false; }
   const int SKIP = reference ? 22 : -1;   // reference: uncond_skip_layers=(22,) for the whole schedule; Studio skips nothing on the SFT model
   double tall = now(); const bool cfgon = cfg != 1.f && !nids.empty();
@@ -433,10 +452,10 @@ static bool generate_full(const std::vector<int>& ids, const std::vector<int>& n
   { std::vector<f32> bands(16); for (int i = 0; i < 16; i++) bands[i] = g_glue.f("rope.bands")[i];   // rope depends on the text length (image tokens sit at coordinate T)
     rope_tables(bands.data(), H, W, T, ntc, (f32*)(blob + L.meta[M_COS]), (f32*)(blob + L.meta[M_SIN]));
     if (cfgon) rope_tables(bands.data(), H, W, Tn, ntu, (f32*)(blob + g_c2), (f32*)(blob + g_s2)); }
-  const std::vector<float> sg = reference ? moss_sigmas(steps, shift) : sgm_sigmas(steps, shift); const int S = (int)sg.size();
+  const std::vector<float> sg = reference ? moss_sigmas(steps, shift) : sdcpp_sigmas(steps, shift); const int S = (int)sg.size();
   printf("schedule %d\n", S); fflush(stdout);   // not "step..": the app counts lines starting with "step" as finished steps
   std::vector<f32> x((size_t)128 * Ni), vc((size_t)128 * Ni), vu(cfgon ? (size_t)128 * Ni : 0);
-  { std::mt19937 gen(seed); std::normal_distribution<float> nd(0.f, 1.f); for (auto& a : x) a = nd(gen); }
+  philox_randn(seed, x.data(), x.size());   // the same noise as Unsloth Studio (sd.cpp) for this seed
   dump("z.bin", x.data(), x.size() * 4); dump("tx.bin", tx.data(), tx.size() * 4); if (cfgon) dump("tn.bin", tn.data(), tn.size() * 4); dump("sig.bin", sg.data(), sg.size() * 4); dump("skip.bin", &SKIP, 4);
   std::vector<f32> rows((size_t)(Ni + std::max(T, Tn)) * 3072), outrows((size_t)Ni * 3072), modv, head;
   std::vector<std::string> df; for (int k = 0; k < NLAYER_DIT; k++) { char p[512]; snprintf(p, sizeof p, "%s/dit/blk%02d.bin", g_dir.c_str(), k); df.push_back(p); }
@@ -502,7 +521,7 @@ int main(int argc, char** argv) {
       printf("loaded %.1f\n", now() - t0); continue;
     }
     if (cmd == "gen") {
-      std::string idsf, outz, mode, negf, sampler; int H, W, steps; unsigned seed; float cfg = 1.f; double shift = 5.0; ss >> idsf >> H >> W >> seed >> steps >> outz >> mode;
+      std::string idsf, outz, mode, negf, sampler; int H, W, steps; unsigned long long seed; float cfg = 1.f; double shift = 5.0; ss >> idsf >> H >> W >> seed >> steps >> outz >> mode;
       const bool full = mode == "full"; if (full) { ss >> cfg >> negf; double sh; if (ss >> sh) { shift = sh; ss >> sampler; } }
       if (!sampler.empty() && sampler != "studio" && sampler != "reference") { printf("error sampler\n"); continue; }
       auto read_ids = [](const std::string& fn, std::vector<int>& v) { FILE* f = fopen(fn.c_str(), "rb"); if (!f) return false; fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
