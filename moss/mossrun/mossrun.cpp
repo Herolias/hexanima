@@ -429,6 +429,7 @@ static bool generate_full(const std::vector<int>& ids, const std::vector<int>& n
   g_full = true;
   for (int s = 0; s < S; s++) {
     const double ts = now(); const float sig = sg[s], sn = s + 1 < S ? sg[s + 1] : 0.f, t = sig * 1000.f;   // FlowMatchEulerDiscreteScheduler: timestep = sigma * 1000 (float32)
+    { char nm[32]; snprintf(nm, sizeof nm, "x%d.bin", s); dump(nm, x.data(), x.size() * 4); }   // per step: input latent and both velocities (check_full.py re-runs each step on these)
     embed_latent(x.data(), Ni, rows.data());
     memcpy(&rows[(size_t)Ni * 3072], tx.data(), (size_t)T * 3072 * 4); rows_to_x32(rows.data(), Nc, 3072, (f32*)(blob + L.meta[M_X]), ntc / 32);
     if (cfgon) { memcpy(&rows[(size_t)Ni * 3072], tn.data(), (size_t)Tn * 3072 * 4); rows_to_x32(rows.data(), Nu, 3072, (f32*)(blob + g_x2), ntu / 32); }
@@ -443,7 +444,7 @@ static bool generate_full(const std::vector<int>& ids, const std::vector<int>& n
     sync_inval(g_blobF); const double tE = now();
     x32_to_rows((const f32*)(blob + L.meta[M_X]), Ni, 3072, outrows.data()); head_velocity(outrows.data(), Ni, head, vc.data());
     if (cfgon) { x32_to_rows((const f32*)(blob + g_x2), Ni, 3072, outrows.data()); head_velocity(outrows.data(), Ni, head, vu.data()); }
-    if (s == 0) { dump("vc0.bin", vc.data(), vc.size() * 4); if (cfgon) dump("vu0.bin", vu.data(), vu.size() * 4); }
+    { char nm[32]; snprintf(nm, sizeof nm, "vc%d.bin", s); dump(nm, vc.data(), vc.size() * 4); if (cfgon) { snprintf(nm, sizeof nm, "vu%d.bin", s); dump(nm, vu.data(), vu.size() * 4); } }
     const float dt = sn - sig;
     if (cfgon) for (size_t i = 0; i < x.size(); i++) x[i] += dt * (vu[i] + cfg * (vc[i] - vu[i]));   // CFG combined in fp32, then Euler
     else for (size_t i = 0; i < x.size(); i++) x[i] += dt * vc[i];

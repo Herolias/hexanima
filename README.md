@@ -36,12 +36,16 @@ about 30 s for 512x768 and about 80 s for 1 Mpx; any size with sides that are mu
 >   each block read) and mossrun runs the official MOSS sampler from `pipeline_moss_image.py`: FlowMatch Euler on the shift-5 schedule snapped to the training grid
 >   (same lengths and sigmas within 6e-8 of the reference scheduler for 1-100 steps), CFG with a negative prompt, block 22 skipped in the negative branch.
 >   Steps 8-60, CFG 1-8, negative prompt; the settings go into the PNG. Both branches run through each DiT block before the next one is read, so the weights are still
->   streamed once per step. Speed on the 8 Elite Gen 5: ~1.6 s per DiT pass at 512x512, ~8.5 s at 1024x1024, so 20 steps with CFG at 1024x1024 take about 6 min.
->   Checked against the fp32 PyTorch reference (`moss/check_full.py` on a `MOSS_DUMP` of a phone run): first-step velocities within 0.04% (both branches).
+>   streamed once per step. Speed on the 8 Elite Gen 5: ~1.6 s per DiT pass at 512x512, ~8.5 s at 1024x1024 (rising to ~10 s as the phone warms up): 20 steps
+>   with CFG at 1024x1024 took 6.6 min.
+>   Checked against the fp32 PyTorch reference (`moss/check_full.py` on a `MOSS_DUMP` of a phone run, 512x512, 8 steps, CFG 3): every step's velocities, recomputed
+>   on the phone's own latents, within 0.03-0.32% (both branches); CFG compounds these fp16-level differences to ~7% in the final latent, which decodes to the
+>   same picture (`moss/decode_cmp.py`: mean pixel difference 2 of 255). Runs are bit-reproducible for a seed.
 >   Needs `files/moss/glue_base.bin` (the SFT model's own time embedding, `moss/export_glue_base.py`). Classic LoRAs are folded a second time without the adapter
 >   (`blkNN.ovf`); merged LoKr blocks serve both modes.
 > - **Adapter precision**: the rapid-moss LoRA's trained factors cancel heavily (|BA| is ~9% of |B||A|), so storing them as trained in 8-bit tiles lost 6-10% of
->   its delta. `export_moss.py` and `lorafold` now store every rank-128 slot as B' = U sqrt(S), A' = sqrt(S) V^T (same product): ~1-1.6% error.
+>   its delta. `export_moss.py` and `lorafold` now store every rank-128 slot as B' = U sqrt(S), A' = sqrt(S) V^T (same product): 1-2.4% error over all 42 blocks,
+>   base weights byte-identical. Same seed in Fast mode: same picture, finer details differ (mean pixel difference 9 of 255).
 > - **Open**: the V81 context binaries and `glue_base.bin` are not hosted anywhere yet, so they are copied into the app with `adb` (`files/anima/{te0..te3,vae}.bin,
 >   te_embed.f16`, `files/vae81/vae_WxH.bin`, `files/moss/glue_base.bin`); sizes above 4096 patches are unverified on V81; full mode is untested on V69.
 
