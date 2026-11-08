@@ -8,7 +8,8 @@
 #   2. every other native library (QNN 2.28 runtime for V69, sd-cli, MOSS helpers) is taken unchanged from the upstream release APK (UPSTREAM_TAG);
 #      with QAIRT set (Qualcomm AI Engine Direct SDK 2.43+, not redistributable: never publish the resulting APK) its V81 runtime is added as
 #      libQnnHtp243.so / libQnnSystem243.so / libQnnHtpV81Stub.so / libQnnHtpV81Skel.so (MOSS-Image decoder on Hexagon V81);
-#   3. the APK is built and signed with the host Android SDK (build-tools 36: the d8 of 34 crashes on classes from JDK 21+; platform 34) and JDK 17+.
+#   3. the APK is built and signed with the host Android SDK (build-tools 36: the d8 of 34 crashes on classes from JDK 21+; platform 36: GenNote uses the Android 16
+#      Live Update API; the target SDK stays 34) and JDK 17+.
 # usage: tools/build_fork.sh [--install]      env: DEBUGGABLE=1 (adb run-as access), SDK (default ~/Android/Sdk), KS (keystore, default ~/.android/debug.keystore), UPSTREAM_TAG (v1.3.0),
 #                                             QAIRT (SDK root with lib/aarch64-android and lib/hexagon-v81; empty = no V81 MOSS decoder)
 set -euo pipefail
@@ -16,7 +17,7 @@ cd "$(dirname "$0")/.."
 ROOT=$PWD; OUT=$ROOT/build_fork; mkdir -p "$OUT/syslib" "$OUT/upstream"
 IMG=ghcr.io/snapdragon-toolchain/arm64-android:v0.8
 CR=$(command -v podman || command -v docker)
-SDK=${SDK:-$HOME/Android/Sdk}; BT=$SDK/build-tools/${BUILD_TOOLS:-36.0.0}; AJ=$SDK/platforms/android-34/android.jar
+SDK=${SDK:-$HOME/Android/Sdk}; BT=$SDK/build-tools/${BUILD_TOOLS:-36.0.0}; AJ=$SDK/platforms/android-${PLATFORM:-36}/android.jar
 KS=${KS:-$HOME/.android/debug.keystore}; TAG=${UPSTREAM_TAG:-v1.3.0}
 
 # ---- 1. native helpers ------------------------------------------------------------------------------------------------

@@ -76,6 +76,12 @@ public class Settings extends Base {
 
         LinearLayout c3 = card(col);
         c3.addView(toggle(L.s("Не гасить экран при генерации", "Keep the screen on while generating"), "", keepOn(this), on -> p.edit().putBoolean("keepon", on).apply()));
+        final boolean bg = ((android.os.PowerManager) getSystemService(POWER_SERVICE)).isIgnoringBatteryOptimizations(getPackageName());
+        c3.addView(choice(L.s("Работа в фоне", "Run in the background"), bg ? L.s("разрешена", "allowed") : L.s("ограничена", "restricted"), v -> {
+            if (bg || !Main.requestBg(this, 1)) startActivityForResult(new android.content.Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS), 1);
+        }));
+        TextView bgNote = text(L.s("Без ограничений батареи: иначе HyperOS замораживает приложение в фоне и генерация встаёт, пока вы в другом приложении", "No battery restrictions: otherwise HyperOS freezes the app in the background and the picture pauses while you use another app"), 12, DIM, false);
+        bgNote.setPadding(dp(2), 0, 0, dp(4)); c3.addView(bgNote);
         if (Moss.is(p.getString("model", ""))) return;   // MOSS-Image takes plain sentences: the quality-tag prefix is for the Anima models only, so the setting is hidden while MOSS is selected
         TextView pl = text(L.s("Теги качества перед описанием (модели Anima)", "Quality tags before the prompt (Anima models)"), 15, TXT, true); pl.setPadding(dp(2), dp(14), 0, dp(6)); c3.addView(pl);
         prefixEdit = field("");
@@ -87,6 +93,8 @@ public class Settings extends Base {
         LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(-2, dp(38)); rl.topMargin = dp(8);
         c3.addView(reset, rl);
     }
+
+    @Override protected void onActivityResult(int req, int res, android.content.Intent d) { if (req == 1) recreate(); }   // the background setting may have changed
 
     @Override protected void onPause() { super.onPause(); if (prefixEdit != null) prefs(this).edit().putString("prefix", prefixEdit.getText().toString()).apply(); }
 

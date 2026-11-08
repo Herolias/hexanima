@@ -54,6 +54,8 @@ public class Main extends Base {
     String model = "";   // id of the selected installed model; anima.sh gets MID/MDIR
     int count = 1;       // pictures per press of Generate
     volatile int curIdx, curN = 1;
+    volatile int nStep = -1, nTotal;   // the sampling step shown (1-based, -1 outside the loop) and the steps of this picture, for the notification
+    volatile long nEnd;                // estimated end of the batch (ms since the epoch, 0 = unknown)
     boolean statusSeen;
     int tick;
 
@@ -423,6 +425,7 @@ public class Main extends Base {
     };
 
     @Override protected void onActivityResult(int req, int res, Intent d) {
+        if (req == 11) { Runnable r = afterBg; afterBg = null; if (r != null) r.run(); return; }   // the background dialog closed: start the picture
         if (req == 9 && res == RESULT_OK && d != null && d.getData() != null) { importLora(d.getData()); return; }
         if (req == 7 && res == RESULT_OK && d != null) {
             prompt.setText(d.getStringExtra("prompt")); seed.setText(d.getStringExtra("seed"));
@@ -802,8 +805,32 @@ public class Main extends Base {
         else ex2.submit(() -> ctlSh.run("touch " + D + "/cancel; sh " + D + "/anima.sh stop < /dev/null >/dev/null 2>&1"));
     }
 
+    /** the app may run in the background without battery restrictions (Android's battery-optimisation exemption; on HyperOS the same switch is
+     *  Battery saver "No restrictions"). Without it HyperOS freezes the whole app a few seconds after it leaves the screen, a foreground service
+     *  notwithstanding, and the picture stops until the app is opened again (measured: one step took 228 s instead of 17 s). */
+    boolean bgAllowed() { return ((PowerManager) getSystemService(POWER_SERVICE)).isIgnoringBatteryOptimizations(getPackageName()); }
+
+    Runnable afterBg;
+    /** once, before the first picture: explains and opens the system dialog; the picture starts when the dialog closes, whatever the answer */
+    void askBackground(Runnable then) {
+        prefs().edit().putBoolean("asked_bg", true).apply();
+        builder().setTitle(L.s("Генерация в фоне", "Generating in the background"))
+            .setMessage(L.s("HyperOS и другие прошивки замораживают приложения в фоне, и генерация останавливается, пока вы в другом приложении. Разрешите HexAnima работать в фоне без ограничений батареи, чтобы картинка делалась с той же скоростью. Изменить это можно позже в Настройках.",
+                "HyperOS and other phone makers' systems freeze apps in the background, and the picture stops while you are in another app. Allow HexAnima to run in the background without battery restrictions so it keeps generating at full speed. You can change this later in Settings."))
+            .setPositiveButton(L.s("Разрешить", "Allow"), (d, w) -> { afterBg = then; if (!requestBg(this, 11)) { afterBg = null; then.run(); } })
+            .setNegativeButton(L.s("Не сейчас", "Not now"), (d, w) -> then.run())
+            .setOnCancelListener(d -> then.run()).show();
+    }
+
+    /** the system's "let the app always run in the background?" dialog; false if this system has none */
+    static boolean requestBg(android.app.Activity a, int req) {
+        try { a.startActivityForResult(new Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + a.getPackageName())), req); return true; }
+        catch (Exception e) { return false; }
+    }
+
     void generate(boolean newSeed) {
         if (model.isEmpty()) { openModels(); return; }
+        if (!busy && !bgAllowed() && !prefs().getBoolean("asked_bg", false)) { askBackground(() -> generate(newSeed)); return; }
         int cw = 0, ch = 0;
         try { cw = Integer.parseInt(wEdit.getText().toString().trim()); ch = Integer.parseInt(hEdit.getText().toString().trim()); } catch (NumberFormatException e) { }
         String bad = isMoss() ? mossSizeError(cw, ch) : sizeError(cw, ch);
@@ -816,7 +843,7 @@ public class Main extends Base {
         long base0 = 0; try { base0 = Long.parseLong(sd); } catch (NumberFormatException ignored) { }
         final long baseSeed = base0;
         final int n = count, w = resW, h = resH;
-        busy = true; cancelled = false; curIdx = 0; curN = n;
+        busy = true; cancelled = false; curIdx = 0; curN = n; nStep = -1; nEnd = 0;
         setModelUi(loaded, false, "");
         View f0 = getCurrentFocus(); if (f0 != null) ((android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(f0.getWindowToken(), 0);
         bar.setProgress(0);
@@ -851,7 +878,7 @@ public class Main extends Base {
             final int total = made;
             if (wasCancelled) loaded = false;   // Stop shut the server down
             busy = false; cancelled = false;
-            app.stopService(new Intent(app, DownloadService.class));
+            GenNote.live = false; app.stopService(new Intent(app, DownloadService.class));
             final Bitmap nb = lastBm;
             ui.post(() -> {
                 getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -882,6 +909,7 @@ public class Main extends Base {
                 try { Thread.sleep(700); } catch (InterruptedException e) { return; }
                 int[] c = count();
                 int st = c[0] - base[0];
+                nStep = c[1] <= base[1] && st < STEPS && c[2] > base[2] ? st + 1 : -1; nTotal = STEPS;
                 if (c[1] > base[1]) setProgressUi(97, L.s("Сохраняю…", "Saving…"), t0);
                 else if (st >= STEPS) setProgressUi(92, L.s("Декодирование…", "Decoding…"), t0);
                 else if (c[2] > base[2]) setProgressUi(15 + (int) (76 * stepShare(st)), L.f("Шаг %d/%d", "Step %d/%d", st + 1, STEPS), t0);  // adapter line = step 1 started
@@ -927,6 +955,12 @@ public class Main extends Base {
             loraEnv = "MOSS_LORA=" + q(ovl.getPath()) + " ";
         }
         final boolean[] done = {false};
+        // time left: the Generate button's estimate until the first step is timed, then the measured seconds per step (+ the decoder);
+        // further pictures of a batch take as long as the ones already made (or the estimate)
+        final long tPic = System.currentTimeMillis(), est = 1000L * Moss.estimate(store.speed(model), w, h, full, steps, cfg), DECODE_MS = 3000;
+        final long perPic = curIdx > 0 ? (tPic - t0) / curIdx : est;
+        final long[] tt = {0, 0, 0};   // when the steps began, when the last step finished, steps finished
+        final long[] at = new long[128];   // at[k]: when k steps had finished (at[0]: when sampling began); full mode has at most 100 steps
         Thread poll = new Thread(() -> {
             while (!done[0]) {
                 try { Thread.sleep(700); } catch (InterruptedException e) { return; }
@@ -934,8 +968,17 @@ public class Main extends Base {
                 try {
                     String[] a = s.trim().split("\\s+"); int te = Integer.parseInt(a[0]), rf = Integer.parseInt(a[1]), st = Integer.parseInt(a[2]), dn = Integer.parseInt(a[3]);
                     final int all = a.length > 4 ? Integer.parseInt(a[4]) : steps;   // full mode: the schedule mossrun settled on
+                    final long now = System.currentTimeMillis(); final boolean sampling = rf > 0 || st > 0 || a.length > 4;
+                    if (sampling && tt[0] == 0) { tt[0] = now; at[0] = now; }
+                    if (st > tt[2] && st < at.length) { for (int k = (int) tt[2] + 1; k <= st; k++) at[k] = now; tt[2] = st; tt[1] = now; }
+                    // seconds per step from the last 3 steps: steps slow down as the phone warms up (measured 18 s -> 23 s over a 20-step 1024x1024 run)
+                    final int win = (int) Math.min(tt[2], 3);
+                    long left = win > 0 && tt[0] > 0 ? (long) ((all - tt[2]) * ((at[(int) tt[2]] - at[(int) tt[2] - win]) / (double) win)) - (now - tt[1]) + DECODE_MS : est - (now - tPic);
+                    if (dn > 0) left = DECODE_MS - 1000;
+                    nEnd = now + Math.max(left, 2000) + (curN - curIdx - 1) * perPic;
+                    nStep = sampling && dn == 0 ? Math.min(st + 1, all) : -1; nTotal = all;
                     if (dn > 0) setProgressUi(94, L.s("Декодирование…", "Decoding…"), t0);
-                    else if (rf > 0 || st > 0 || a.length > 4) setProgressUi(22 + 70 * st / all, L.f("Шаг %d/%d", "Step %d/%d", Math.min(st + 1, all), all), t0);   // a cached prompt skips the refiner line
+                    else if (sampling) setProgressUi(22 + 70 * st / all, L.f("Шаг %d/%d", "Step %d/%d", Math.min(st + 1, all), all), t0);   // a cached prompt skips the refiner line
                     else if (te > 0) setProgressUi(20, L.s("Подготовка текста…", "Preparing the text…"), t0);
                     else setProgressUi(8, L.s("Кодирование текста на NPU…", "Encoding the text on the NPU…"), t0);
                 } catch (Exception ignored) { }
@@ -983,7 +1026,9 @@ public class Main extends Base {
     void setProgressUi(int pct, String msg, long t0) {
         final int all = (curIdx * 100 + pct) / curN;
         final String pre = curN > 1 ? "(" + (curIdx + 1) + "/" + curN + ")  " : "";
-        final String t = L.f("%s  ·  %.0f с", "%s  ·  %.0f s", pre + msg, (System.currentTimeMillis() - t0) / 1000.0);
+        final long now = System.currentTimeMillis(), end = nEnd;
+        final String t = L.f("%s  ·  %.0f с", "%s  ·  %.0f s", pre + msg, (now - t0) / 1000.0) + (end > now + 1000 ? "  ·  " + GenNote.left(end - now) : "");
         ui.post(() -> { bar.setProgress(all); status.setText(t); });
+        GenNote.update(getApplicationContext(), pre + msg, all, nStep, nTotal, end);   // the notification (Live Update / HyperOS Super Island)
     }
 }

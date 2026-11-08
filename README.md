@@ -60,6 +60,18 @@ about 30 s for 512x768 and about 80 s for 1 Mpx; any size with sides that are mu
 >   8-bit tiles (7.6 GB in `te/`, largest layer 246 MB, still fits mossrun's 250 MB stream buffer) plus `embd.q8` (the Q8_0 token table, 1.08 GB); mossrun uses
 >   `embd.q8` when it is present and keys its text caches apart. Decoder ruled out: the FLUX.2 small decoder and the full FLUX.2-klein VAE decode the same latent
 >   to the same sharpness.
+> - **Background generation**: on HyperOS a foreground service does not protect an app from the system freezer. Measured on the Xiaomi 17 Pro Max
+>   (HyperOS OS4.0, Android 17): three seconds after switching to another app, SmartPower marked HexAnima "idle" and GreezeManager froze its whole UID cgroup,
+>   the native `libmossrun.so` included, so the picture simply stopped (one step took 228 s instead of 17 s, finishing only when the app was reopened).
+>   Apps with Android's battery-optimisation exemption (HyperOS: Battery saver "No restrictions") are never frozen this way, so before the first picture
+>   the app asks once for it (and Settings has a "Run in the background" row). With it, a 20-step 1024x1024 picture made entirely behind Chrome took
+>   381 s, never frozen, no slower than in the foreground. Generation also holds a partial wake lock, so the CPU does not suspend between NPU calls with the screen off.
+> - **Progress in the status bar / Super Island**: the generation notification shows the step and the time left (seconds per step over the last three
+>   steps, which follows the phone warming up; the size estimate before the first step) as an Android 16 Live Update: ProgressStyle, promoted ongoing, short text "5/20 · 4m", a countdown in the notification.
+>   HyperOS 3+ draws a promoted Live Update in the Super Island for any app. Xiaomi's own focus template (`miui.focus.param`) is not used: SystemUI accepts
+>   it only from apps whose signature Xiaomi has registered ("Authentication failed because scope mismatch", even though `canShowFocus` returns true).
+> - **Rotation**: `Main` handles orientation / screen-size changes itself; recreating it (rotating the phone mid-picture) used to leave the running picture
+>   without its progress and Stop button.
 > - **Open**: the V81 context binaries and `glue_base.bin` are not hosted anywhere yet, so they are copied into the app with `adb` (`files/anima/{te0..te3,vae}.bin,
 >   te_embed.f16`, `files/vae81/vae_WxH.bin`, `files/moss/glue_base.bin`, the 8-bit `files/moss/te/` + `embd.q8`); sizes above 4096 patches are unverified on V81; full mode is untested on V69.
 
@@ -72,6 +84,7 @@ about 30 s for 512x768 and about 80 s for 1 Mpx; any size with sides that are mu
 - Prompt tag suggestions (Danbooru tags), templates, quality-tag prefix (Anima models only; MOSS-Image takes plain sentences and gets no tags).
 - Your own LoRA for MOSS-Image: pick a `.safetensors` file, the app checks it at once (layer names, shapes, rank, data type) and says why if it does not fit; a strength slider (0-2). The LoRA is folded with the built-in 4-step adapter on the phone (about 15 s the first time) and never leaves the device.
 - Live RAM meter, thermal / battery warnings, the model unloads itself when idle.
+- Generation keeps running at full speed in the background, with the step and the time left in the notification (Android 16 Live Update; the Super Island on HyperOS).
 - Light / dark / system themes, notifications, 13 languages (English, Russian, Chinese, Japanese, Korean, Spanish, Portuguese, German, French, Indonesian, Turkish, Vietnamese, Hindi).
 
 ## Picture quality
